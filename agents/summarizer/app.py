@@ -14,6 +14,7 @@ from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
 from log_tools import LogTools
+from prompts import DEFAULT_AGENT_QUESTION, get_agent_question, get_system_prompt
 
 logging.basicConfig(
     level=logging.INFO,
@@ -21,25 +22,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("log-agent")
 
-DEFAULT_QUESTION = (
-    "Analyze why this pipeline failed. Produce a short DevOps-focused "
-    "analysis with summary, top failure pattern, likely root cause, evidence, and "
-    "next checks. Also add recomendations for how to fix the pipeline failure based on the log analysis. in the end add author name and date of the analysis."
-)
-DEFAULT_SYSTEM_PROMPT = (
-    "You are an Azure DevOps pipeline log analysis agent. "
-    "You do not receive the full log directly. Use the available tools to inspect "
-    "only the parts you need. Start from compact tools such as get_log_overview, "
-    "find_failure_markers, top_error_signatures, or likely_root_cause, and use "
-    "search_logs or get_log_excerpt only when you need more evidence. "
-    "Do not invent evidence. Keep evidence short and cite line numbers when "
-    "possible. When you have enough information, return one valid JSON object only "
-    "with these keys: summary, top_failure_pattern, likely_root_cause, confidence, "
-    "evidence, next_checks. "
-    "The confidence value must be one of: high, medium, low. "
-    "The evidence and next_checks values must be arrays of short strings."
-)
-SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT", DEFAULT_SYSTEM_PROMPT)
+SYSTEM_PROMPT = get_system_prompt()
 OLLAMA_TIMEOUT_SEC = int(os.getenv("OLLAMA_TIMEOUT_SEC", "180"))
 MAX_STEPS_DEFAULT = int(os.getenv("MAX_STEPS", "6"))
 REMOTE_SOURCE_TIMEOUT_SEC = int(os.getenv("LOG_SOURCE_TIMEOUT_SEC", "60"))
@@ -75,7 +58,7 @@ def parse_args():
     )
     parser.add_argument(
         "--question",
-        default=os.getenv("AGENT_QUESTION", DEFAULT_QUESTION),
+        default=get_agent_question(),
         help="Question or task for the log agent.",
     )
     parser.add_argument(

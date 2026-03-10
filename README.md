@@ -49,16 +49,17 @@ All tools:
 
 ## Where To Edit Prompts
 
-Recommended runtime prompt override:
+Single source of truth for default prompt structure:
+
+- [agents/summarizer/prompts.py](/home/asenic/multi-agent-digest/agents/summarizer/prompts.py)
+  - `SYSTEM_PROMPT_STRUCTURE`
+  - `QUESTION_TEMPLATES`
+
+Recommended runtime overrides:
 
 - [docker-compose.yml](/home/asenic/multi-agent-digest/docker-compose.yml)
   - `services.log-agent.environment.SYSTEM_PROMPT`
-
-Default fallback prompt in code:
-
-- [agents/summarizer/app.py](/home/asenic/multi-agent-digest/agents/summarizer/app.py)
-  - `DEFAULT_SYSTEM_PROMPT`
-  - `SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT", ...)`
+  - `services.log-agent.environment.AGENT_QUESTION`
 
 ## Ollama Config
 

@@ -12,6 +12,7 @@ RUN useradd --create-home --uid 10001 agent
 
 COPY app.py /app/app.py
 COPY log_tools.py /app/log_tools.py
+COPY prompts.py /app/prompts.py
 COPY entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh && chown -R agent:agent /app
 
