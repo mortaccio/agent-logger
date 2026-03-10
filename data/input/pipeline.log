@@ -1,0 +1,215 @@
+2026-03-10T07:12:01.102Z ##[section]Starting: Initialize job
+2026-03-10T07:12:01.301Z Agent name: Hosted Agent
+2026-03-10T07:12:01.301Z Agent machine name: fv-az842-551
+2026-03-10T07:12:01.301Z Current agent version: 3.245.0
+2026-03-10T07:12:01.401Z ##[section]Starting: Checkout monorepo
+2026-03-10T07:12:02.114Z git fetch --tags --force --prune --progress origin
+2026-03-10T07:12:03.502Z From https://dev.azure.com/acme/platform/_git/payments-platform
+2026-03-10T07:12:03.503Z  * [new ref]         refs/tags/release-2026.03.10 -> release-2026.03.10
+2026-03-10T07:12:04.981Z Checking out commit 84fbe8d5d1d8ec11f4d0d2f448c9d7a2b1fb4b09
+2026-03-10T07:12:05.440Z ##[section]Finishing: Checkout monorepo
+2026-03-10T07:12:05.991Z ##[section]Starting: Setup toolchain
+2026-03-10T07:12:06.411Z Python 3.11.8
+2026-03-10T07:12:06.599Z Node v20.12.2
+2026-03-10T07:12:06.812Z Terraform v1.8.5
+2026-03-10T07:12:07.001Z aws-cli/2.18.16 Python/3.11.8 Linux/6.8.0 botocore/2.7.16
+2026-03-10T07:12:07.244Z ##[warning] Terraform provider hashicorp/aws 5.66.0 contains deprecated attribute aws_s3_bucket_object.acl
+2026-03-10T07:12:08.004Z ##[section]Finishing: Setup toolchain
+2026-03-10T07:12:08.615Z ##[section]Starting: Restore Python dependencies
+2026-03-10T07:12:09.114Z pip install -r services/orchestrator/requirements.txt
+2026-03-10T07:12:10.998Z Collecting boto3==1.35.20
+2026-03-10T07:12:11.844Z Collecting kubernetes==30.1.0
+2026-03-10T07:12:12.571Z Successfully installed boto3-1.35.20 kubernetes-30.1.0 redis-5.0.8 psycopg-3.2.3
+2026-03-10T07:12:13.094Z ##[section]Finishing: Restore Python dependencies
+2026-03-10T07:12:13.501Z ##[section]Starting: Restore frontend dependencies
+2026-03-10T07:12:14.115Z npm ci --prefer-offline --no-audit
+2026-03-10T07:12:15.062Z npm WARN deprecated inflight@1.0.6: This module is not supported and leaks memory
+2026-03-10T07:12:16.403Z npm ERR! code EAI_AGAIN
+2026-03-10T07:12:16.403Z npm ERR! syscall getaddrinfo
+2026-03-10T07:12:16.403Z npm ERR! network request to https://registry.npmjs.org/semver failed, reason: getaddrinfo EAI_AGAIN registry.npmjs.org
+2026-03-10T07:12:16.404Z ##[warning] npm install failed on first attempt, retrying with fresh cache
+2026-03-10T07:12:18.012Z npm cache verify
+2026-03-10T07:12:22.813Z added 1634 packages in 18s
+2026-03-10T07:12:23.002Z ##[section]Finishing: Restore frontend dependencies
+2026-03-10T07:12:23.451Z ##[section]Starting: Lint and unit tests
+2026-03-10T07:12:24.004Z pnpm lint
+2026-03-10T07:12:25.114Z 432 files checked, 0 errors, 12 warnings
+2026-03-10T07:12:25.902Z pytest -q services/payments/tests
+2026-03-10T07:12:31.119Z 228 passed, 3 skipped, 1 xfailed in 5.17s
+2026-03-10T07:12:31.823Z pnpm test:integration -- --reporter=dot
+2026-03-10T07:12:36.552Z FAIL tests/integration/refunds/reconcile.spec.ts > reconcile stale refunds after ledger replay
+2026-03-10T07:12:36.553Z AssertionError: expected 202 to equal 200
+2026-03-10T07:12:36.554Z ##[warning] flaky integration failure detected, rerun attempt 1/2
+2026-03-10T07:12:39.773Z PASS tests/integration/refunds/reconcile.spec.ts > reconcile stale refunds after ledger replay
+2026-03-10T07:12:40.199Z Test Suites: 71 passed, 71 total
+2026-03-10T07:12:40.815Z ##[section]Finishing: Lint and unit tests
+2026-03-10T07:12:41.104Z ##[section]Starting: Build and push images
+2026-03-10T07:12:41.999Z aws ecr get-login-password --region eu-central-1 | docker login --username AWS --password-stdin 123456789012.dkr.ecr.eu-central-1.amazonaws.com
+2026-03-10T07:12:42.994Z WARNING! Your password will be stored unencrypted in /home/vsts/.docker/config.json
+2026-03-10T07:12:44.661Z Login Succeeded
+2026-03-10T07:12:45.019Z docker build -t payments-api:84fbe8d5 -f docker/payments-api.Dockerfile .
+2026-03-10T07:12:47.881Z #9 exporting layers done
+2026-03-10T07:12:48.115Z #9 writing image sha256:af4c93ff2c9fbc9470a80722d17b7ee20bc91ea85dfb86df984d25b9a2c0834f done
+2026-03-10T07:12:49.229Z docker push 123456789012.dkr.ecr.eu-central-1.amazonaws.com/payments-api:84fbe8d5
+2026-03-10T07:12:50.113Z layer 94964f9b8f2d already exists
+2026-03-10T07:12:51.214Z received unexpected HTTP status: 503 Service Unavailable
+2026-03-10T07:12:51.215Z ##[warning] transient ECR push failure, retrying in 5s
+2026-03-10T07:12:57.611Z latest: digest: sha256:049df5d9c2bb3f3bba128d6e793441af0c3a711916c4b7f42bfd267f2287dd87 size: 3242
+2026-03-10T07:12:58.001Z ##[section]Finishing: Build and push images
+2026-03-10T07:12:58.441Z ##[section]Starting: Terraform init
+2026-03-10T07:12:59.110Z terraform -chdir=infra/live/prod init -upgrade
+2026-03-10T07:13:00.881Z Initializing the backend...
+2026-03-10T07:13:01.291Z Successfully configured the backend "s3"! Terraform will automatically use this backend unless the backend configuration changes.
+2026-03-10T07:13:02.112Z Initializing provider plugins...
+2026-03-10T07:13:03.773Z - Installing hashicorp/aws v5.66.0...
+2026-03-10T07:13:05.118Z - Installed hashicorp/aws v5.66.0 (signed by HashiCorp)
+2026-03-10T07:13:05.559Z Terraform has been successfully initialized!
+2026-03-10T07:13:06.003Z ##[section]Finishing: Terraform init
+2026-03-10T07:12:58.800Z service=payments-api level=INFO msg="request completed" status=200 latency_ms=30 path=/v1/payments/100
+2026-03-10T07:12:59.800Z service=payments-worker level=INFO msg="ledger batch flushed" events=37 shard=101
+2026-03-10T07:13:00.800Z service=fraud-checker level=WARN msg="elevated p95 latency" p95_ms=44 model=fraud-v4
+2026-03-10T07:13:01.800Z service=event-router level=INFO msg="kafka commit complete" partition=103 offset=51
+2026-03-10T07:13:02.800Z service=auth level=WARN msg="JWT token near expiry" user_id=u-00104 ttl_s=58
+2026-03-10T07:13:03.800Z service=reporting level=INFO msg="athena query succeeded" query_id=q-00105 scanned_mb=65
+2026-03-10T07:13:04.800Z service=payments-api level=INFO msg="request completed" status=200 latency_ms=72 path=/v1/payments/106
+2026-03-10T07:13:05.800Z service=payments-worker level=INFO msg="ledger batch flushed" events=79 shard=107
+2026-03-10T07:13:06.800Z service=fraud-checker level=WARN msg="elevated p95 latency" p95_ms=86 model=fraud-v4
+2026-03-10T07:13:07.800Z service=event-router level=INFO msg="kafka commit complete" partition=109 offset=93
+2026-03-10T07:13:07.800Z service=terraform-wrapper level=WARN msg="provider retry due to throttling" aws_service=iam attempt=1
+2026-03-10T07:13:08.800Z service=auth level=WARN msg="JWT token near expiry" user_id=u-00110 ttl_s=100
+2026-03-10T07:13:09.800Z service=reporting level=INFO msg="athena query succeeded" query_id=q-00111 scanned_mb=107
+2026-03-10T07:13:10.800Z service=payments-api level=INFO msg="request completed" status=200 latency_ms=114 path=/v1/payments/112
+2026-03-10T07:13:11.800Z service=payments-worker level=INFO msg="ledger batch flushed" events=121 shard=113
+2026-03-10T07:13:11.800Z service=platform-cache level=ERROR msg="Redis timeout talking to cache-primary" timeout_ms=630 key=merchant:1013
+2026-03-10T07:13:11.800Z service=platform-cache level=INFO msg="retry succeeded" attempt=2 key=merchant:1013
+2026-03-10T07:13:12.800Z service=fraud-checker level=WARN msg="elevated p95 latency" p95_ms=128 model=fraud-v4
+2026-03-10T07:13:13.800Z service=event-router level=INFO msg="kafka commit complete" partition=115 offset=135
+2026-03-10T07:13:14.800Z service=auth level=WARN msg="JWT token near expiry" user_id=u-00116 ttl_s=142
+2026-03-10T07:13:15.800Z service=reporting level=INFO msg="athena query succeeded" query_id=q-00117 scanned_mb=149
+2026-03-10T07:13:16.800Z service=payments-api level=INFO msg="request completed" status=200 latency_ms=156 path=/v1/payments/118
+2026-03-10T07:13:17.800Z service=payments-worker level=INFO msg="ledger batch flushed" events=163 shard=119
+2026-03-10T07:13:18.800Z service=fraud-checker level=WARN msg="elevated p95 latency" p95_ms=170 model=fraud-v4
+2026-03-10T07:13:19.800Z service=event-router level=INFO msg="kafka commit complete" partition=121 offset=177
+2026-03-10T07:13:19.800Z service=terraform-wrapper level=WARN msg="provider retry due to throttling" aws_service=iam attempt=1
+2026-03-10T07:13:20.800Z service=auth level=WARN msg="JWT token near expiry" user_id=u-00122 ttl_s=184
+2026-03-10T07:13:21.800Z service=reporting level=INFO msg="athena query succeeded" query_id=q-00123 scanned_mb=191
+2026-03-10T07:13:22.800Z service=payments-api level=INFO msg="request completed" status=200 latency_ms=198 path=/v1/payments/124
+2026-03-10T07:13:23.800Z service=payments-worker level=INFO msg="ledger batch flushed" events=205 shard=125
+2026-03-10T07:13:24.800Z service=fraud-checker level=WARN msg="elevated p95 latency" p95_ms=212 model=fraud-v4
+2026-03-10T07:13:25.800Z service=event-router level=INFO msg="kafka commit complete" partition=127 offset=219
+2026-03-10T07:13:26.800Z service=auth level=WARN msg="JWT token near expiry" user_id=u-00128 ttl_s=226
+2026-03-10T07:13:27.800Z service=reporting level=INFO msg="athena query succeeded" query_id=q-00129 scanned_mb=233
+2026-03-10T07:13:28.800Z service=payments-api level=INFO msg="request completed" status=200 latency_ms=240 path=/v1/payments/130
+2026-03-10T07:13:29.800Z service=payments-worker level=INFO msg="ledger batch flushed" events=247 shard=131
+2026-03-10T07:13:30.800Z service=fraud-checker level=WARN msg="elevated p95 latency" p95_ms=254 model=fraud-v4
+2026-03-10T07:13:31.800Z service=event-router level=INFO msg="kafka commit complete" partition=133 offset=261
+2026-03-10T07:13:31.800Z service=platform-cache level=ERROR msg="Redis timeout talking to cache-primary" timeout_ms=830 key=merchant:1033
+2026-03-10T07:13:31.800Z service=platform-cache level=INFO msg="retry succeeded" attempt=2 key=merchant:1033
+2026-03-10T07:13:32.800Z service=auth level=WARN msg="JWT token near expiry" user_id=u-00134 ttl_s=268
+2026-03-10T07:13:33.800Z service=reporting level=INFO msg="athena query succeeded" query_id=q-00135 scanned_mb=275
+2026-03-10T07:13:34.800Z service=payments-api level=INFO msg="request completed" status=200 latency_ms=282 path=/v1/payments/136
+2026-03-10T07:13:35.800Z service=payments-worker level=INFO msg="ledger batch flushed" events=289 shard=137
+2026-03-10T07:13:35.800Z service=terraform-wrapper level=WARN msg="provider retry due to throttling" aws_service=iam attempt=2
+2026-03-10T07:13:36.800Z service=fraud-checker level=WARN msg="elevated p95 latency" p95_ms=296 model=fraud-v4
+2026-03-10T07:13:37.800Z service=event-router level=INFO msg="kafka commit complete" partition=139 offset=303
+2026-03-10T07:13:38.800Z service=auth level=WARN msg="JWT token near expiry" user_id=u-00140 ttl_s=310
+2026-03-10T07:13:39.800Z service=reporting level=INFO msg="athena query succeeded" query_id=q-00141 scanned_mb=317
+2026-03-10T07:13:40.800Z service=payments-api level=INFO msg="request completed" status=200 latency_ms=324 path=/v1/payments/142
+2026-03-10T07:13:41.800Z service=payments-worker level=INFO msg="ledger batch flushed" events=331 shard=143
+2026-03-10T07:13:42.800Z service=fraud-checker level=WARN msg="elevated p95 latency" p95_ms=338 model=fraud-v4
+2026-03-10T07:13:42.800Z service=terraform-wrapper level=WARN msg="provider retry due to throttling" aws_service=iam attempt=3
+2026-03-10T07:13:43.800Z service=event-router level=INFO msg="kafka commit complete" partition=145 offset=345
+2026-03-10T07:13:44.800Z service=auth level=WARN msg="JWT token near expiry" user_id=u-00146 ttl_s=352
+2026-03-10T07:13:45.800Z service=reporting level=INFO msg="athena query succeeded" query_id=q-00147 scanned_mb=359
+2026-03-10T07:13:46.800Z service=payments-api level=INFO msg="request completed" status=200 latency_ms=366 path=/v1/payments/148
+2026-03-10T07:13:47.800Z service=payments-worker level=INFO msg="ledger batch flushed" events=373 shard=149
+2026-03-10T07:13:48.800Z service=fraud-checker level=WARN msg="elevated p95 latency" p95_ms=380 model=fraud-v4
+2026-03-10T07:13:49.800Z service=event-router level=INFO msg="kafka commit complete" partition=151 offset=387
+2026-03-10T07:13:49.800Z service=terraform-wrapper level=WARN msg="provider retry due to throttling" aws_service=iam attempt=1
+2026-03-10T07:13:50.800Z service=auth level=WARN msg="JWT token near expiry" user_id=u-00152 ttl_s=394
+2026-03-10T07:13:51.800Z service=reporting level=INFO msg="athena query succeeded" query_id=q-00153 scanned_mb=401
+2026-03-10T07:13:52.800Z service=payments-api level=INFO msg="request completed" status=200 latency_ms=408 path=/v1/payments/154
+2026-03-10T07:13:53.800Z service=payments-worker level=INFO msg="ledger batch flushed" events=415 shard=155
+2026-03-10T07:13:54.800Z service=fraud-checker level=WARN msg="elevated p95 latency" p95_ms=422 model=fraud-v4
+2026-03-10T07:13:55.800Z service=event-router level=INFO msg="kafka commit complete" partition=157 offset=429
+2026-03-10T07:13:56.800Z service=auth level=WARN msg="JWT token near expiry" user_id=u-00158 ttl_s=436
+2026-03-10T07:13:56.800Z service=platform-cache level=ERROR msg="Redis timeout talking to cache-primary" timeout_ms=1080 key=merchant:1058
+2026-03-10T07:13:56.800Z service=platform-cache level=INFO msg="retry succeeded" attempt=2 key=merchant:1058
+2026-03-10T07:13:57.800Z service=reporting level=INFO msg="athena query succeeded" query_id=q-00159 scanned_mb=443
+2026-03-10T07:13:06.500Z ##[section]Starting: Terraform plan
+2026-03-10T07:13:07.106Z terraform -chdir=infra/live/prod plan -out=tfplan
+2026-03-10T07:13:08.902Z data.aws_caller_identity.current: Reading...
+2026-03-10T07:13:08.903Z data.aws_eks_cluster.prod: Reading...
+2026-03-10T07:13:09.551Z aws_iam_role.app_task: Refreshing state... [id=payments-prod-task-role]
+2026-03-10T07:13:09.881Z aws_iam_role_policy_attachment.ecr_read: Refreshing state... [id=payments-prod-task-role-20260301]
+2026-03-10T07:13:10.194Z module.network.aws_security_group.payments_api: Refreshing state... [id=sg-0e8b9d891a6f2f771]
+2026-03-10T07:13:10.588Z module.compute.aws_launch_template.api: Refreshing state... [id=lt-0ab219d98f3e6cb11]
+2026-03-10T07:13:11.105Z module.observability.aws_cloudwatch_metric_alarm.api_5xx: Refreshing state... [id=payments-prod-api-5xx]
+2026-03-10T07:13:11.511Z ##[warning] Resource targeting in use for module.compute and module.runtime. This is not recommended for routine operations.
+2026-03-10T07:13:12.771Z Terraform used the selected providers to generate the following execution plan.
+2026-03-10T07:13:12.772Z   ~ update in-place module.compute.aws_launch_template.api
+2026-03-10T07:13:12.772Z   ~ update in-place module.eks.aws_eks_node_group.blue
+2026-03-10T07:13:12.773Z   + create module.runtime.aws_iam_role_policy_attachment.ssm_read
+2026-03-10T07:13:12.773Z   + create module.runtime.aws_iam_role_policy_attachment.kms_decrypt
+2026-03-10T07:13:12.774Z   ~ update in-place module.payments.aws_ssm_parameter.runtime_flags
+2026-03-10T07:13:13.444Z Plan: 2 to add, 3 to change, 0 to destroy.
+2026-03-10T07:13:14.111Z Saved the plan to: tfplan
+2026-03-10T07:13:14.602Z ##[section]Finishing: Terraform plan
+2026-03-10T07:13:15.043Z ##[section]Starting: Terraform apply
+2026-03-10T07:13:15.900Z terraform -chdir=infra/live/prod apply -auto-approve tfplan
+2026-03-10T07:13:17.211Z Acquiring state lock. This may take a few moments...
+2026-03-10T07:13:18.105Z module.runtime.aws_iam_role_policy_attachment.ssm_read: Creating...
+2026-03-10T07:13:18.609Z module.payments.aws_ssm_parameter.runtime_flags: Modifying... [id=/prod/payments/runtime-flags]
+2026-03-10T07:13:19.442Z module.compute.aws_launch_template.api: Modifying... [id=lt-0ab219d98f3e6cb11]
+2026-03-10T07:13:20.118Z module.eks.aws_eks_node_group.blue: Modifying... [id=payments-prod:payments-prod-blue]
+2026-03-10T07:13:20.772Z module.observability.aws_cloudwatch_metric_alarm.api_5xx: Modifications complete after 1s [id=payments-prod-api-5xx]
+2026-03-10T07:13:21.109Z module.payments.aws_ssm_parameter.runtime_flags: Modifications complete after 2s [id=/prod/payments/runtime-flags]
+2026-03-10T07:13:22.003Z module.compute.aws_launch_template.api: Modifications complete after 3s [id=lt-0ab219d98f3e6cb11]
+2026-03-10T07:13:24.188Z module.runtime.aws_iam_role_policy_attachment.ssm_read: Creation complete after 6s [id=payments-prod-task-role-20260310-ssm]
+2026-03-10T07:13:25.442Z module.runtime.aws_iam_role_policy_attachment.kms_decrypt: Creating...
+2026-03-10T07:13:26.223Z ##[warning] provider.aws: retrying request after RequestLimitExceeded for iam:AttachRolePolicy
+2026-03-10T07:13:28.611Z module.eks.aws_eks_node_group.blue: Still modifying... [id=payments-prod:payments-prod-blue, 10s elapsed]
+2026-03-10T07:13:34.903Z module.eks.aws_eks_node_group.blue: Still modifying... [id=payments-prod:payments-prod-blue, 16s elapsed]
+2026-03-10T07:13:39.115Z ##vso[task.logissue type=warning]CloudWatch alarm payments-prod-api-p99-latency entered ALARM during rollout but auto-recovered in 90 seconds
+2026-03-10T07:13:40.504Z module.runtime.aws_iam_role_policy_attachment.kms_decrypt: Still creating... [14s elapsed]
+2026-03-10T07:13:42.117Z module.eks.aws_eks_node_group.blue: Modifications complete after 22s [id=payments-prod:payments-prod-blue]
+2026-03-10T07:13:43.014Z Error: attaching IAM Policy (arn:aws:iam::aws:policy/KMSDecryptForPayments) to IAM Role (payments-prod-task-role): operation error IAM: AttachRolePolicy, https response error StatusCode: 403, RequestID: 9db451f2-5cb7-4f52-9cb9-07fe1417a3c9, api error AccessDenied: User: arn:aws:sts::123456789012:assumed-role/ado-oidc-prod/azure-devops-build is not authorized to perform: iam:AttachRolePolicy on resource: role payments-prod-task-role because no identity-based policy allows the iam:AttachRolePolicy action
+2026-03-10T07:13:43.015Z 
+2026-03-10T07:13:43.015Z   with module.runtime.aws_iam_role_policy_attachment.kms_decrypt,
+2026-03-10T07:13:43.016Z   on modules/runtime/iam.tf line 84, in resource "aws_iam_role_policy_attachment" "kms_decrypt":
+2026-03-10T07:13:43.016Z   84: resource "aws_iam_role_policy_attachment" "kms_decrypt" {
+2026-03-10T07:13:43.601Z Releasing state lock. This may take a few moments...
+2026-03-10T07:13:44.118Z ##[error]Terraform apply failed with exit code 1
+2026-03-10T07:13:44.551Z ##vso[task.logissue type=error]Terraform apply failed. Root failure is AccessDenied on iam:AttachRolePolicy for payments-prod-task-role
+2026-03-10T07:13:45.102Z ##[section]Finishing: Terraform apply
+2026-03-10T07:13:45.633Z ##[section]Starting: Collect failure diagnostics
+2026-03-10T07:13:46.201Z kubectl get pods -n payments-prod -o wide
+2026-03-10T07:13:47.551Z payments-api-7d94d66f77-jpmz9   1/1 Running            0          22m   10.32.4.11   ip-10-0-22-19
+2026-03-10T07:13:47.552Z payments-worker-6bc754cbf8-lxq7g 1/1 Running            0          22m   10.32.4.27   ip-10-0-22-20
+2026-03-10T07:13:47.552Z refunds-api-78f88458c5-8xjnd  0/1 CrashLoopBackOff   6          11m   10.32.4.31   ip-10-0-22-20
+2026-03-10T07:13:47.553Z metrics-adapter-84bc659f67-zngcf 1/1 Running 0 4d 10.32.3.81 ip-10-0-21-17
+2026-03-10T07:13:48.314Z kubectl logs deploy/refunds-api -n payments-prod --tail=30
+2026-03-10T07:13:48.991Z 2026-03-10T07:13:11Z service=refunds-api level=INFO msg="Starting HTTP server" port=8080 commit=84fbe8d5
+2026-03-10T07:13:49.221Z 2026-03-10T07:13:12Z service=refunds-api level=WARN msg="Redis latency above SLO" p99_ms=114
+2026-03-10T07:13:49.441Z 2026-03-10T07:13:13Z service=refunds-api level=ERROR msg="failed to decrypt payout key" error="AccessDeniedException: kms:Decrypt is not authorized for alias/payments-runtime" tenant=merchant-eu-17
+2026-03-10T07:13:49.771Z 2026-03-10T07:13:13Z service=refunds-api level=ERROR msg="startup failed" reason="cannot load encrypted runtime config"
+2026-03-10T07:13:49.991Z panic: runtime config bootstrap failed
+2026-03-10T07:13:49.992Z goroutine 1 [running]:
+2026-03-10T07:13:49.992Z main.main()
+2026-03-10T07:13:49.993Z   /workspace/services/refunds-api/cmd/server/main.go:41 +0x217
+2026-03-10T07:13:50.442Z kubectl logs deploy/payments-api -n payments-prod --tail=20
+2026-03-10T07:13:50.991Z 2026-03-10T07:13:16Z service=payments-api level=INFO msg="health check passed" latency_ms=21
+2026-03-10T07:13:51.201Z 2026-03-10T07:13:17Z service=payments-api level=INFO msg="request completed" path=/v1/payments status=200 latency_ms=44
+2026-03-10T07:13:51.402Z 2026-03-10T07:13:18Z service=payments-api level=WARN msg="downstream inventory timeout" timeout_ms=800 path=/reserve
+2026-03-10T07:13:51.702Z 2026-03-10T07:13:18Z service=payments-api level=INFO msg="retry succeeded" attempt=2 path=/reserve
+2026-03-10T07:13:52.119Z aws sts get-caller-identity
+2026-03-10T07:13:52.612Z {"UserId":"AROATX7BI3S6VJYB2J7XG:azure-devops-build","Account":"123456789012","Arn":"arn:aws:sts::123456789012:assumed-role/ado-oidc-prod/azure-devops-build"}
+2026-03-10T07:13:53.006Z ##[warning] Detected multiple secondary errors in diagnostics, but pipeline blocker remains Terraform AccessDenied during IAM policy attachment
+2026-03-10T07:13:53.441Z ##[section]Finishing: Collect failure diagnostics
+2026-03-10T07:13:54.114Z ##[section]Starting: Publish artifacts
+2026-03-10T07:13:54.801Z Uploading terraform.tfstate.backup
+2026-03-10T07:13:55.449Z Uploading kubectl-refunds-api.log
+2026-03-10T07:13:56.093Z Uploading diagnostics-summary.json
+2026-03-10T07:13:56.711Z ##[section]Finishing: Publish artifacts
+2026-03-10T07:13:57.119Z ##[error]Task TerraformApply failed with exit code 1
+2026-03-10T07:13:57.552Z ##[section]Finishing: Job deploy_prod

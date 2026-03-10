@@ -1,429 +1,729 @@
-import logging
+import argparse
 import json
+import logging
 import os
 import re
 import urllib.error
 import urllib.request
-from collections import Counter
+from pathlib import Path
+
+from log_tools import LogTools
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
-logger = logging.getLogger("summarizer")
+logger = logging.getLogger("log-agent")
 
-INPUT_FILE = "/data/ingested.txt"
-OUTPUT_FILE = "/data/summary.txt"
-OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434/api/generate")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3:latest")
-OLLAMA_TIMEOUT_SEC = int(os.getenv("OLLAMA_TIMEOUT_SEC", "300"))
-ENABLE_PREDICTION = os.getenv("ENABLE_PREDICTION", "true").lower() in {
-    "1", "true", "yes", "on"
-}
-MAX_MODEL_INPUT_CHARS = int(os.getenv("MAX_MODEL_INPUT_CHARS", "120000"))
-MAX_SIGNAL_LINES = int(os.getenv("MAX_SIGNAL_LINES", "4000"))
-MAX_TAIL_LINES = int(os.getenv("MAX_TAIL_LINES", "300"))
-MAX_OUTPUT_LINES = int(os.getenv("MAX_OUTPUT_LINES", "120"))
-MIN_VALID_SUMMARY_LINES = int(os.getenv("MIN_VALID_SUMMARY_LINES", "3"))
-MAX_FINDINGS = int(os.getenv("MAX_FINDINGS", "5"))
-SYSTEM_PROMPT = os.getenv(
-    "SYSTEM_PROMPT",
-    (
-        "You analyze large log batches and detect operational issues. "
-        "Return plain text lines only (not markdown bullets). "
-        "Do not add intro sentences, markdown headings, or paragraphs. "
-        "Always start with one recap line in this exact format: "
-        "'LOG_RECAP: ...'. "
-        "Then list findings as one line per issue in this exact format: "
-        "'FINDING: severity=Critical|High|Medium|Low | source=... | "
-        "error=... | impact=... | action=... | evidence=...'. "
-        "Prioritize failures, exceptions, and recurring warnings. "
-        "If no errors are found, include "
-        "'NO_ERRORS: none detected' and 'ACTION: continue monitoring'. "
-        "Keep each line short, specific, and factual. "
-        "Do not use unicode bullets such as '•'."
-    ),
+DEFAULT_QUESTION = (
+    "Analyze why this pipeline failed. Produce a short DevOps-focused "
+    "analysis with summary, top failure pattern, likely root cause, evidence, and "
+    "next checks. Also add recomendations for how to fix the pipeline failure based on the log analysis. in the end add author name and date of the analysis."
 )
-PREDICTIVE_PROMPT = os.getenv(
-    "PREDICTIVE_PROMPT",
-    (
-        "If input includes tabular or time-series patterns, add forecast bullets "
-        "in this format: '- Prediction: ...', '- Confidence: ...', "
-        "'- Rationale: ...'. "
-        "If data is not sufficient, include "
-        "'- Prediction: Not reliable (insufficient data)'."
-    ),
+DEFAULT_SYSTEM_PROMPT = (
+    "You are an Azure DevOps pipeline log analysis agent. "
+    "You do not receive the full log directly. Use the available tools to inspect "
+    "only the parts you need. Start from compact tools such as get_log_overview, "
+    "find_failure_markers, top_error_signatures, or likely_root_cause, and use "
+    "search_logs or get_log_excerpt only when you need more evidence. "
+    "Do not invent evidence. Keep evidence short and cite line numbers when "
+    "possible. When you have enough information, return one valid JSON object only "
+    "with these keys: summary, top_failure_pattern, likely_root_cause, confidence, "
+    "evidence, next_checks. "
+    "The confidence value must be one of: high, medium, low. "
+    "The evidence and next_checks values must be arrays of short strings."
+)
+SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT", DEFAULT_SYSTEM_PROMPT)
+OLLAMA_TIMEOUT_SEC = int(os.getenv("OLLAMA_TIMEOUT_SEC", "180"))
+MAX_STEPS_DEFAULT = int(os.getenv("MAX_STEPS", "6"))
+COMPAT_TOOL_PROTOCOL = (
+    "Native Ollama tool calling is unavailable for this model. "
+    "Use this JSON protocol instead. Return exactly one JSON object per turn and "
+    "nothing else. If you need a tool, return "
+    '{"action":"tool_call","tool_name":"<tool name>","arguments":{...},"reason":"..."}'
+    ". Use exactly one tool per turn. If you are done, return "
+    '{"action":"final","analysis":{"summary":"...","top_failure_pattern":"...",'
+    '"likely_root_cause":"...","confidence":"high|medium|low","evidence":["..."],'
+    '"next_checks":["..."]}}'
+    ". Do not wrap the JSON in markdown."
 )
 
-FILE_MARKER_RE = re.compile(r"^---\s+(.+?)\s+---\s*$")
-SERVICE_RE = re.compile(r"\bservice=([A-Za-z0-9._:-]+)")
-MESSAGE_RE = re.compile(r'msg="([^"]+)"')
-SIGNAL_TOKENS = (
-    "level=critical",
-    "[critical]",
-    "level=error",
-    "[error]",
-    "exception",
-    "traceback",
-    "fatal",
-    "build failure",
-    "failed to execute",
-    "cannot find symbol",
-    "timeout",
-    "level=warn",
-    "[warn]",
-    "[warning]",
-    " warning",
-)
-SEVERITY_RANK = {"Critical": 4, "High": 3, "Medium": 2, "Low": 1}
+
+class OllamaRequestError(RuntimeError):
+    def __init__(self, message, status_code=None, detail=None):
+        super().__init__(message)
+        self.status_code = status_code
+        self.detail = detail or message
 
 
-def is_signal_line(line):
-    lower = line.lower()
-    return any(token in lower for token in SIGNAL_TOKENS)
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Container-friendly agentic log analyzer for logs."
+    )
+    parser.add_argument("--log-file", required=True, help="Path to the pipeline log file.")
+    parser.add_argument(
+        "--question",
+        default=os.getenv("AGENT_QUESTION", DEFAULT_QUESTION),
+        help="Question or task for the log agent.",
+    )
+    parser.add_argument(
+        "--output-file",
+        required=True,
+        help="Output file path. Use .md or .json.",
+    )
+    parser.add_argument(
+        "--model",
+        default=os.getenv("OLLAMA_MODEL"),
+        help="Ollama model name. Falls back to OLLAMA_MODEL.",
+    )
+    parser.add_argument(
+        "--ollama-host",
+        default=os.getenv("OLLAMA_HOST"),
+        help="Ollama host, for example http://127.0.0.1:11434",
+    )
+    parser.add_argument(
+        "--ollama-url",
+        default=os.getenv("OLLAMA_URL"),
+        help="Optional full Ollama URL. If set to /api/generate it will be converted to /api/chat.",
+    )
+    parser.add_argument(
+        "--max-steps",
+        type=int,
+        default=MAX_STEPS_DEFAULT,
+        help="Maximum number of LLM interaction steps.",
+    )
+    return parser.parse_args()
 
 
-def condense_input_for_model(text):
-    if len(text) <= MAX_MODEL_INPUT_CHARS:
-        return text, False
+def resolve_ollama_chat_url(ollama_host=None, ollama_url=None):
+    url = None
+    if ollama_url:
+        url = ollama_url.strip()
+    elif ollama_host:
+        url = ollama_host.rstrip("/") + "/api/chat"
 
-    lines = text.splitlines()
-    signal_lines = []
-    current_marker = None
-    last_marker_written = None
+    if not url:
+        return None
 
-    for raw_line in lines:
-        line = raw_line.rstrip()
-        marker = FILE_MARKER_RE.match(line.strip())
-        if marker:
-            current_marker = marker.group(1)
-            continue
+    if url.endswith("/api/generate"):
+        return url[: -len("/api/generate")] + "/api/chat"
+    if url.endswith("/api/chat"):
+        return url
+    return url.rstrip("/") + "/api/chat"
 
-        if not is_signal_line(line):
-            continue
 
-        if current_marker and last_marker_written != current_marker:
-            signal_lines.append(f"--- {current_marker} ---")
-            last_marker_written = current_marker
+def build_user_message(question, overview):
+    compact_overview = json.dumps(overview, ensure_ascii=True, indent=2)
+    return (
+        f"Question:\n{question}\n\n"
+        "Log metadata and initial overview:\n"
+        f"{compact_overview}\n\n"
+        "Use tools when you need more detail. Return JSON only when done."
+    )
 
-        signal_lines.append(line)
-        if len(signal_lines) >= MAX_SIGNAL_LINES:
-            break
 
-    tail_lines = lines[-MAX_TAIL_LINES:]
-    condensed_lines = [
-        (
-            "[Input condensed for model: "
-            f"original_chars={len(text)} original_lines={len(lines)}]"
-        ),
-        "[Signal-focused excerpt]",
-    ]
-    if signal_lines:
-        condensed_lines.extend(signal_lines)
-    else:
-        condensed_lines.append(
-            "No explicit signal lines found. Using recent tail excerpt."
+def build_tool_catalog(tool_schemas):
+    catalog = []
+    for schema in tool_schemas:
+        function = schema.get("function", {})
+        catalog.append(
+            {
+                "name": function.get("name"),
+                "description": function.get("description"),
+                "parameters": function.get("parameters", {}),
+            }
         )
-
-    condensed_lines.append("[Recent tail excerpt]")
-    condensed_lines.extend(tail_lines)
-
-    condensed = "\n".join(condensed_lines)
-    if len(condensed) > MAX_MODEL_INPUT_CHARS:
-        condensed = condensed[:MAX_MODEL_INPUT_CHARS]
-    return condensed, True
+    return catalog
 
 
-def build_prompt(text):
-    prompt = SYSTEM_PROMPT
-    if ENABLE_PREDICTION:
-        prompt = f"{prompt}\n\n{PREDICTIVE_PROMPT}"
-    return f"{prompt}\n\nInput:\n{text}"
+def build_compat_user_message(question, overview, tool_catalog):
+    compact_overview = json.dumps(overview, ensure_ascii=True, indent=2)
+    compact_catalog = json.dumps(tool_catalog, ensure_ascii=True, indent=2)
+    return (
+        f"Question:\n{question}\n\n"
+        f"{COMPAT_TOOL_PROTOCOL}\n\n"
+        "Available tools:\n"
+        f"{compact_catalog}\n\n"
+        "Log metadata and initial overview:\n"
+        f"{compact_overview}\n\n"
+        "Select the next best tool or return the final analysis."
+    )
 
 
-def normalize_summary_lines(summary):
-    normalized = []
-    seen = set()
+def call_ollama_chat(model, ollama_chat_url, messages, tools):
+    payload = {
+        "model": model,
+        "messages": messages,
+        "stream": False,
+        "options": {"temperature": 0},
+    }
+    if tools:
+        payload["tools"] = tools
+    body = json.dumps(payload).encode("utf-8")
+    request = urllib.request.Request(
+        url=ollama_chat_url,
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
 
-    for raw_line in summary.splitlines():
-        stripped = raw_line.strip()
-        if not stripped:
-            continue
+    try:
+        with urllib.request.urlopen(request, timeout=OLLAMA_TIMEOUT_SEC) as response:
+            raw = response.read().decode("utf-8")
+        decoded = json.loads(raw)
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise OllamaRequestError(
+            f"Ollama HTTP error {exc.code}: {detail}",
+            status_code=exc.code,
+            detail=detail,
+        ) from exc
+    except urllib.error.URLError as exc:
+        raise OllamaRequestError(f"Ollama connection error: {exc}") from exc
+    except TimeoutError as exc:
+        raise OllamaRequestError("Ollama request timed out") from exc
+    except json.JSONDecodeError as exc:
+        raise OllamaRequestError(f"Invalid JSON from Ollama: {exc}") from exc
 
-        if stripped.startswith("- "):
-            content = stripped[2:].strip()
-        elif stripped.startswith("* "):
-            content = stripped[2:].strip()
-        elif stripped.startswith("•"):
-            content = stripped.lstrip("•").strip()
-        else:
-            content = stripped
+    message = decoded.get("message")
+    if not isinstance(message, dict):
+        raise OllamaRequestError("Ollama response is missing the 'message' object")
+    return message
 
-        if not content:
-            continue
 
-        lower = content.lower()
-        if lower.startswith("here is the daily digest"):
-            continue
-        if lower.startswith("here are the plain text lines"):
-            continue
+def parse_tool_arguments(raw_arguments):
+    if isinstance(raw_arguments, dict):
+        return raw_arguments
+    if isinstance(raw_arguments, str):
+        text = raw_arguments.strip()
+        if not text:
+            return {}
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
 
-        if content.lower() in seen:
-            continue
-        seen.add(content.lower())
-        normalized.append(content)
 
-    if len(normalized) > MAX_OUTPUT_LINES:
-        normalized = normalized[:MAX_OUTPUT_LINES]
+def extract_json_object(text):
+    candidate = text.strip()
+    if not candidate:
+        return None
+    try:
+        parsed = json.loads(candidate)
+        return parsed if isinstance(parsed, dict) else None
+    except json.JSONDecodeError:
+        pass
+
+    match = re.search(r"\{.*\}", candidate, re.DOTALL)
+    if not match:
+        return None
+
+    try:
+        parsed = json.loads(match.group(0))
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def parse_compat_action(text):
+    payload = extract_json_object(text)
+    if not isinstance(payload, dict):
+        return None
+
+    action = payload.get("action")
+    if action == "tool_call":
+        tool_name = payload.get("tool_name") or payload.get("tool")
+        arguments = payload.get("arguments") or payload.get("args") or {}
+        if not isinstance(tool_name, str) or not tool_name.strip():
+            return None
+        if not isinstance(arguments, dict):
+            arguments = {}
+        return {
+            "action": "tool_call",
+            "tool_name": tool_name.strip(),
+            "arguments": arguments,
+        }
+
+    if action == "final":
+        analysis = payload.get("analysis")
+        if isinstance(analysis, dict):
+            return {"action": "final", "analysis": analysis}
+        return {"action": "final", "analysis": payload}
+
+    analysis_keys = {
+        "summary",
+        "top_failure_pattern",
+        "likely_root_cause",
+        "confidence",
+        "evidence",
+        "next_checks",
+    }
+    if analysis_keys.intersection(payload.keys()):
+        return {"action": "final", "analysis": payload}
+    return None
+
+
+def is_unsupported_tools_error(error):
+    detail = (getattr(error, "detail", "") or str(error)).lower()
+    return getattr(error, "status_code", None) == 400 and "support tools" in detail
+
+
+def ensure_string(value, fallback):
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return fallback
+
+
+def ensure_string_list(value, fallback):
+    if not isinstance(value, list):
+        return fallback
+
+    cleaned = []
+    for item in value:
+        if isinstance(item, str) and item.strip():
+            cleaned.append(item.strip())
+    return cleaned or fallback
+
+
+def normalize_analysis(candidate, fallback):
+    if not isinstance(candidate, dict):
+        return fallback
+
+    next_checks = candidate.get("next_checks")
+    if next_checks is None:
+        next_checks = candidate.get("next_steps")
+
+    normalized = {
+        "summary": ensure_string(candidate.get("summary"), fallback["summary"]),
+        "top_failure_pattern": ensure_string(
+            candidate.get("top_failure_pattern"),
+            fallback["top_failure_pattern"],
+        ),
+        "likely_root_cause": ensure_string(
+            candidate.get("likely_root_cause"),
+            fallback["likely_root_cause"],
+        ),
+        "confidence": ensure_string(candidate.get("confidence"), fallback["confidence"]).lower(),
+        "evidence": ensure_string_list(candidate.get("evidence"), fallback["evidence"]),
+        "next_checks": ensure_string_list(next_checks, fallback["next_checks"]),
+    }
+
+    if normalized["confidence"] not in {"high", "medium", "low"}:
+        normalized["confidence"] = fallback["confidence"]
     return normalized
 
 
-def summary_is_usable(lines):
-    if len(lines) < MIN_VALID_SUMMARY_LINES:
-        return False
-    if not lines[0].lower().startswith("log_recap:"):
-        return False
-
-    has_structured_findings = any(
-        line.lower().startswith("finding:")
-        or line.lower().startswith("no_errors:")
-        or line.lower().startswith("action:")
-        for line in lines[1:]
-    )
-    if not has_structured_findings:
-        return False
-
-    meaningful = 0
-    total_len = 0
-    for line in lines:
-        total_len += len(line)
-        if re.search(r"[A-Za-z0-9]{3}", line):
-            meaningful += 1
-
-    avg_len = total_len / len(lines) if lines else 0
-    if meaningful < MIN_VALID_SUMMARY_LINES:
-        return False
-    if avg_len < 8:
-        return False
-    return True
+def format_evidence_items(items):
+    formatted = []
+    for item in items or []:
+        line_number = item.get("line_number")
+        section = item.get("section")
+        text = item.get("text")
+        if line_number and section:
+            formatted.append(f"line {line_number} [{section}]: {text}")
+        elif line_number:
+            formatted.append(f"line {line_number}: {text}")
+        elif text:
+            formatted.append(text)
+    return formatted
 
 
-def extract_message(line):
-    message = MESSAGE_RE.search(line)
-    if message:
-        return message.group(1).strip()[:180]
-
-    cleaned = re.sub(r"^\d{4}-\d{2}-\d{2}T\S+\s*", "", line)
-    cleaned = re.sub(r"\bservice=\S+\s*", "", cleaned)
-    cleaned = re.sub(r"\blevel=\S+\s*", "", cleaned)
-    cleaned = re.sub(r"\breq_id=\S+\s*", "", cleaned)
-    cleaned = re.sub(
-        r"^\[(INFO|WARN|WARNING|ERROR|CRITICAL)\]\s*",
-        "",
-        cleaned,
-        flags=re.IGNORECASE,
-    )
-    cleaned = re.sub(r"\s+", " ", cleaned).strip()
-    return cleaned[:180]
-
-
-def detect_severity(line_lower):
-    if "critical" in line_lower:
-        return "Critical"
-    if (
-        "error" in line_lower
-        or "exception" in line_lower
-        or "traceback" in line_lower
-        or "fatal" in line_lower
-        or "fail" in line_lower
-        or "timeout" in line_lower
-    ):
-        return "High"
-    if "warn" in line_lower or "warning" in line_lower:
-        return "Medium"
-    return "Low"
-
-
-def scan_logs(text):
-    level_counts = Counter({"INFO": 0, "WARN": 0, "ERROR": 0, "CRITICAL": 0})
-    events = {}
-    current_source = "unknown"
-    sources = set()
-    total_lines = 0
-
-    for raw_line in text.splitlines():
-        line = raw_line.strip()
-        if not line:
+def unique_preserve_order(items):
+    seen = set()
+    ordered = []
+    for item in items:
+        if item in seen:
             continue
+        seen.add(item)
+        ordered.append(item)
+    return ordered
 
-        marker = FILE_MARKER_RE.match(line)
-        if marker:
-            current_source = marker.group(1)
-            sources.add(current_source)
-            continue
 
-        total_lines += 1
-        lower = line.lower()
+def build_fallback_analysis(log_tools):
+    overview = log_tools.get_log_overview(limit=5)
+    markers = log_tools.find_failure_markers(limit=8)
+    signatures = log_tools.top_error_signatures(top_k=3, min_occurrences=1)
+    root_causes = log_tools.likely_root_cause(top_k=3)
 
-        if "level=info" in lower or line.startswith("[INFO]"):
-            level_counts["INFO"] += 1
-        if (
-            "level=warn" in lower
-            or line.startswith("[WARN]")
-            or line.startswith("[WARNING]")
-        ):
-            level_counts["WARN"] += 1
-        if "level=error" in lower or line.startswith("[ERROR]"):
-            level_counts["ERROR"] += 1
-        if "level=critical" in lower or line.startswith("[CRITICAL]"):
-            level_counts["CRITICAL"] += 1
+    marker_total = sum(markers.get("counts_by_type", {}).values())
+    line_count = overview.get("line_count", 0)
+    top_signature = ""
+    if signatures.get("signatures"):
+        top_signature = signatures["signatures"][0]["signature"]
 
-        if not is_signal_line(line):
-            continue
+    top_candidate = root_causes.get("top_candidate") or {}
+    evidence = format_evidence_items(top_candidate.get("evidence"))
+    if not evidence:
+        evidence = format_evidence_items(markers.get("matches", [])[:3])
 
-        source_match = SERVICE_RE.search(line)
-        source = source_match.group(1) if source_match else current_source
-        message = extract_message(line)
-        severity = detect_severity(lower)
-        key = (severity, source, message)
-        if key not in events:
-            events[key] = {"count": 0, "evidence": line}
-        events[key]["count"] += 1
+    if top_candidate:
+        summary = (
+            f"Detected {marker_total} failure markers across {line_count} log lines. "
+            f"The strongest failure signal is near line {top_candidate['line_number']}."
+        )
+    elif marker_total:
+        summary = (
+            f"Detected {marker_total} failure markers across {line_count} log lines, "
+            "but no single root cause candidate dominated the heuristics."
+        )
+    else:
+        summary = (
+            f"No explicit Azure failure markers were found in {line_count} log lines. "
+            "The failure likely needs manual inspection of the final log section."
+        )
 
-    sorted_events = sorted(
-        events.items(),
-        key=lambda item: (SEVERITY_RANK.get(item[0][0], 0), item[1]["count"]),
-        reverse=True,
-    )
+    next_checks = []
+    if top_candidate:
+        next_checks.append(
+            f"Inspect lines around {top_candidate['line_number']} in {top_candidate['section']}."
+        )
+    if top_signature:
+        next_checks.append(f"Search for repeated instances of: {top_signature}")
+    if markers.get("counts_by_type", {}).get("exit_code"):
+        next_checks.append(
+            "Check the failing task command and non-zero exit code in the Azure DevOps step output."
+        )
+    if markers.get("counts_by_type", {}).get("azure_task_issue"):
+        next_checks.append(
+            "Review the task.logissue error lines and the exact task parameters used in that stage."
+        )
+    if not next_checks:
+        next_checks.append("Inspect the final section of the pipeline log for the first non-success marker.")
+        next_checks.append("Re-run the failing job with verbose logging if the current evidence is insufficient.")
 
+    confidence = "low"
+    if top_candidate:
+        confidence = "high" if top_candidate.get("score", 0) >= 11 else "medium"
+    elif marker_total:
+        confidence = "medium"
+
+    analysis = {
+        "summary": summary,
+        "top_failure_pattern": top_signature or "No repeated error signature was extracted.",
+        "likely_root_cause": top_candidate.get("summary")
+        or "No single root cause candidate was isolated from the current log markers.",
+        "confidence": confidence,
+        "evidence": unique_preserve_order(evidence)[:5],
+        "next_checks": unique_preserve_order(next_checks)[:5],
+    }
+    return normalize_analysis(analysis, analysis)
+
+
+def build_report(
+    *,
+    log_file,
+    question,
+    output_file,
+    model,
+    ollama_chat_url,
+    max_steps,
+    status,
+    analysis,
+    tool_trace,
+    steps_used,
+    error_message=None,
+):
     return {
-        "total_lines": total_lines,
-        "source_count": len(sources) or 1,
-        "level_counts": level_counts,
-        "events": sorted_events,
+        "status": status,
+        "question": question,
+        "log_file": str(log_file),
+        "output_file": str(output_file),
+        "model": model,
+        "ollama_chat_url": ollama_chat_url,
+        "max_steps": max_steps,
+        "steps_used": steps_used,
+        "error": error_message,
+        "analysis": analysis,
+        "tool_trace": tool_trace,
     }
 
 
-def build_recap_line(scan):
-    counts = scan["level_counts"]
-    return (
-        "LOG_RECAP: scanned "
-        f"{scan['total_lines']} lines across {scan['source_count']} file(s); "
-        f"critical={counts['CRITICAL']}, error={counts['ERROR']}, "
-        f"warn={counts['WARN']}, info={counts['INFO']}."
+def render_markdown(report):
+    analysis = report["analysis"]
+    lines = [
+        "# Pipeline Failure Analysis",
+        "",
+        f"- Status: {report['status']}",
+        f"- Log file: `{report['log_file']}`",
+        f"- Model: `{report['model'] or 'not-used'}`",
+        f"- Steps used: {report['steps_used']}/{report['max_steps']}",
+    ]
+
+    if report.get("error"):
+        lines.extend(["", f"- Agent note: {report['error']}"])
+
+    lines.extend(
+        [
+            "",
+            "## Summary",
+            "",
+            analysis["summary"],
+            "",
+            "## Top Failure Pattern",
+            "",
+            analysis["top_failure_pattern"],
+            "",
+            "## Likely Root Cause",
+            "",
+            f"{analysis['likely_root_cause']} (confidence: {analysis['confidence']})",
+            "",
+            "## Evidence",
+            "",
+        ]
     )
 
+    if analysis["evidence"]:
+        for item in analysis["evidence"]:
+            lines.append(f"- {item}")
+    else:
+        lines.append("- No concise evidence was extracted.")
 
-def impact_text(severity):
-    if severity == "Critical":
-        return "Potential outage or major transaction loss risk."
-    if severity == "High":
-        return "Failed operations likely affecting users."
-    if severity == "Medium":
-        return "Early warning signs that can become incidents."
-    return "Low immediate impact."
+    lines.extend(["", "## Next Checks", ""])
+    for item in analysis["next_checks"]:
+        lines.append(f"- {item}")
 
+    if report["tool_trace"]:
+        lines.extend(["", "## Tool Trace", ""])
+        for entry in report["tool_trace"]:
+            state = "ok" if entry.get("ok") else "error"
+            lines.append(
+                f"- step {entry['step']}: `{entry['tool']}` ({state}) with args `{json.dumps(entry['arguments'], ensure_ascii=True)}`"
+            )
 
-def action_text(severity, source):
-    if severity in {"Critical", "High"}:
-        return f"Investigate {source} immediately and verify recovery."
-    if severity == "Medium":
-        return f"Review {source} warnings and set alert thresholds."
-    return f"Monitor {source} for recurrence."
-
-
-def build_fallback_summary(text):
-    scan = scan_logs(text)
-    lines = [build_recap_line(scan)]
-
-    if not scan["events"]:
-        lines.append("NO_ERRORS: none detected")
-        lines.append("ACTION: continue monitoring")
-        return "\n".join(lines)
-
-    for (severity, source, message), meta in scan["events"][:MAX_FINDINGS]:
-        lines.append(
-            "FINDING: "
-            f"severity={severity} | "
-            f"source={source} | "
-            f"error={message} (x{meta['count']}) | "
-            f"impact={impact_text(severity)} | "
-            f"action={action_text(severity, source)} | "
-            f"evidence={meta['evidence'][:220]}"
-        )
-
-    return "\n".join(lines)
+    return "\n".join(lines) + "\n"
 
 
-def finalize_summary(model_summary, raw_text):
-    normalized = normalize_summary_lines(model_summary)
-    if summary_is_usable(normalized):
-        if not normalized[0].lower().startswith("log_recap:"):
-            normalized.insert(0, build_recap_line(scan_logs(raw_text)))
-        return "\n".join(normalized[:MAX_OUTPUT_LINES])
+def write_report(report, output_file):
+    output_path = Path(output_file)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    logger.warning(
-        "Model summary failed quality checks; using deterministic fallback."
+    if output_path.suffix.lower() == ".json":
+        output_path.write_text(json.dumps(report, ensure_ascii=True, indent=2) + "\n", encoding="utf-8")
+        return
+
+    output_path.write_text(render_markdown(report), encoding="utf-8")
+
+
+def run_agent(log_tools, question, model, ollama_chat_url, max_steps):
+    fallback = build_fallback_analysis(log_tools)
+    tool_trace = []
+
+    if not model:
+        return "degraded", fallback, tool_trace, 0, "OLLAMA_MODEL is not set; wrote deterministic fallback analysis."
+    if not ollama_chat_url:
+        return "degraded", fallback, tool_trace, 0, "OLLAMA host/URL is not set; wrote deterministic fallback analysis."
+
+    overview = log_tools.get_log_overview(limit=5)
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": build_user_message(question, overview)},
+    ]
+    tool_schemas = log_tools.get_tool_schemas()
+    last_error = None
+
+    for step in range(1, max_steps + 1):
+        logger.info("Agent step %d/%d", step, max_steps)
+        try:
+            message = call_ollama_chat(model, ollama_chat_url, messages, tool_schemas)
+        except OllamaRequestError as exc:
+            if step == 1 and is_unsupported_tools_error(exc):
+                logger.warning(
+                    "Model does not support native tools; switching to compatibility tool loop."
+                )
+                return run_agent_compat(
+                    log_tools=log_tools,
+                    question=question,
+                    model=model,
+                    ollama_chat_url=ollama_chat_url,
+                    max_steps=max_steps,
+                    fallback=fallback,
+                )
+            last_error = str(exc)
+            logger.error(last_error)
+            return "degraded", fallback, tool_trace, step - 1, last_error
+
+        assistant_message = {
+            "role": "assistant",
+            "content": message.get("content", "") or "",
+        }
+        if message.get("tool_calls"):
+            assistant_message["tool_calls"] = message["tool_calls"]
+        messages.append(assistant_message)
+
+        tool_calls = message.get("tool_calls") or []
+        if tool_calls:
+            for tool_call in tool_calls:
+                function_call = tool_call.get("function", {})
+                tool_name = function_call.get("name", "")
+                arguments = parse_tool_arguments(function_call.get("arguments"))
+                logger.info("Executing tool '%s' with args %s", tool_name, arguments)
+                result = log_tools.execute(tool_name, arguments)
+                tool_trace.append(
+                    {
+                        "step": step,
+                        "tool": tool_name,
+                        "arguments": arguments,
+                        "ok": result.get("ok", False),
+                    }
+                )
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_name": tool_name,
+                        "content": json.dumps(result, ensure_ascii=True),
+                    }
+                )
+            continue
+
+        parsed = extract_json_object(message.get("content", ""))
+        if parsed is not None:
+            normalized = normalize_analysis(parsed, fallback)
+            return "ok", normalized, tool_trace, step, None
+
+        if step < max_steps:
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "Return the final answer now as one valid JSON object with "
+                        "keys: summary, top_failure_pattern, likely_root_cause, "
+                        "confidence, evidence, next_checks. Do not use markdown."
+                    ),
+                }
+            )
+
+    last_error = (
+        "The LLM did not return a valid final JSON response within the configured max_steps; "
+        "wrote a partial deterministic analysis."
     )
-    return build_fallback_summary(raw_text)
+    logger.warning(last_error)
+    return "partial", fallback, tool_trace, max_steps, last_error
 
 
-def summarize_locally(text):
-    """Call a local Ollama instance from inside a Docker container."""
-    condensed_text, was_condensed = condense_input_for_model(text)
-    if was_condensed:
-        logger.info(
-            "Condensed input for model: original=%d chars, sent=%d chars",
-            len(text),
-            len(condensed_text),
-        )
+def run_agent_compat(log_tools, question, model, ollama_chat_url, max_steps, fallback):
+    tool_trace = []
+    tool_schemas = log_tools.get_tool_schemas()
+    tool_catalog = build_tool_catalog(tool_schemas)
+    overview = log_tools.get_log_overview(limit=5)
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": build_compat_user_message(question, overview, tool_catalog)},
+    ]
 
-    payload = {
-        "model": OLLAMA_MODEL,
-        "prompt": build_prompt(condensed_text),
-        "stream": False
-    }
-    try:
-        body = json.dumps(payload).encode("utf-8")
-        req = urllib.request.Request(
-            url=OLLAMA_URL,
-            data=body,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=OLLAMA_TIMEOUT_SEC) as resp:
-            content = resp.read().decode("utf-8")
-        return json.loads(content).get("response", "No response")
-    except (
-        urllib.error.HTTPError,
-        urllib.error.URLError,
-        TimeoutError,
-        json.JSONDecodeError,
-    ) as e:
-        return f"Ollama error: {e}"
+    for step in range(1, max_steps + 1):
+        logger.info("Compatibility agent step %d/%d", step, max_steps)
+        try:
+            message = call_ollama_chat(model, ollama_chat_url, messages, tools=None)
+        except OllamaRequestError as exc:
+            error_message = str(exc)
+            logger.error(error_message)
+            return "degraded", fallback, tool_trace, step - 1, error_message
+
+        content = message.get("content", "") or ""
+        messages.append({"role": "assistant", "content": content})
+        action = parse_compat_action(content)
+
+        if not action:
+            if step < max_steps:
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "Your previous response was invalid. Return exactly one JSON object. "
+                            "Use either action=tool_call or action=final."
+                        ),
+                    }
+                )
+                continue
+            break
+
+        if action["action"] == "tool_call":
+            tool_name = action["tool_name"]
+            arguments = action["arguments"]
+            logger.info("Executing compat tool '%s' with args %s", tool_name, arguments)
+            result = log_tools.execute(tool_name, arguments)
+            tool_trace.append(
+                {
+                    "step": step,
+                    "tool": tool_name,
+                    "arguments": arguments,
+                    "ok": result.get("ok", False),
+                }
+            )
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        f"Tool result for {tool_name}:\n"
+                        f"{json.dumps(result, ensure_ascii=True)}\n\n"
+                        "If you need more information, return another tool_call JSON object. "
+                        "If you are done, return action=final with the analysis JSON."
+                    ),
+                }
+            )
+            continue
+
+        normalized = normalize_analysis(action["analysis"], fallback)
+        return "ok", normalized, tool_trace, step, None
+
+    error_message = (
+        "The LLM did not return a valid final JSON response within the configured max_steps; "
+        "wrote a partial deterministic analysis."
+    )
+    logger.warning(error_message)
+    return "partial", fallback, tool_trace, max_steps, error_message
+
 
 def main():
-    with open(INPUT_FILE, "r", encoding="utf-8") as f:
-        raw_text = f.read()
+    args = parse_args()
+    log_path = Path(args.log_file)
+    output_path = Path(args.output_file)
 
-    if not raw_text.strip():
-        logger.warning("Empty input. Writing fallback summary.")
-        summary = "LOG_RECAP: no input data available.\nNO_ERRORS: none detected"
-    else:
-        try:
-            model_summary = summarize_locally(raw_text)
-            if model_summary.startswith("Ollama error:"):
-                logger.error(model_summary)
-                summary = build_fallback_summary(raw_text)
-            else:
-                summary = finalize_summary(model_summary, raw_text)
-        except Exception as e:
-            logger.error(f"Summarization failed: {e}")
-            summary = build_fallback_summary(raw_text)
+    if not log_path.exists():
+        logger.error("Log file not found: %s", log_path)
+        return 1
+    if not log_path.is_file():
+        logger.error("Log path is not a file: %s", log_path)
+        return 1
 
-    with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
-        f.write(summary)
-    logger.info(f"Summary written to {OUTPUT_FILE}")
+    max_steps = max(1, min(args.max_steps, 12))
+    ollama_chat_url = resolve_ollama_chat_url(args.ollama_host, args.ollama_url)
+    log_tools = LogTools(log_path)
+
+    status, analysis, tool_trace, steps_used, error_message = run_agent(
+        log_tools=log_tools,
+        question=args.question,
+        model=args.model,
+        ollama_chat_url=ollama_chat_url,
+        max_steps=max_steps,
+    )
+
+    report = build_report(
+        log_file=log_path,
+        question=args.question,
+        output_file=output_path,
+        model=args.model,
+        ollama_chat_url=ollama_chat_url,
+        max_steps=max_steps,
+        status=status,
+        analysis=analysis,
+        tool_trace=tool_trace,
+        steps_used=steps_used,
+        error_message=error_message,
+    )
+    try:
+        write_report(report, output_path)
+    except PermissionError:
+        logger.error(
+            "Cannot write analysis to %s. Check ownership/permissions of the mounted output directory.",
+            output_path,
+        )
+        return 1
+    logger.info("Analysis written to %s", output_path)
+    return 0
+
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

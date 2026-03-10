@@ -1,56 +1,34 @@
-version: "3.9"
-
 services:
-  ingestor:
-    build: ./agents/ingestor
-    container_name: agent_ingestor
-    user: "1000:1000"
-    environment:
-      - MAX_TABLE_ROWS=200
-    volumes:
-      - ./data:/data
-    restart: "no"
-
-  summarizer:
+  log-agent:
     build: ./agents/summarizer
-    container_name: agent_summarizer
-    user: "1000:1000"
+    container_name: log_agent
+    user: "${LOCAL_UID:-1000}:${LOCAL_GID:-1000}"
     network_mode: "host"
     environment:
-      - OPENAI_API_KEY=${OPENAI_API_KEY}
-      - OLLAMA_URL=http://127.0.0.1:11434/api/generate
-      - OLLAMA_MODEL=llama3:latest
-      - ENABLE_PREDICTION=true
-      - 'PREDICTIVE_PROMPT=If input includes tabular or time-series patterns, add forecast bullets in this format: "- Prediction: ...", "- Confidence: ...", "- Rationale: ...". If data is not sufficient, include "- Prediction: Not reliable (insufficient data)".'
-    depends_on:
-      ingestor:
-        condition: service_completed_successfully
-    volumes:
-      - ./data:/data
-    deploy:
-      resources:
-        limits:
-          memory: 512M
-    restart: "no"
-
-  prioritizer:
-    build: ./agents/prioritizer
-    container_name: agent_prioritizer
-    user: "1000:1000"
-    depends_on:
-      summarizer:
-        condition: service_completed_successfully
-    volumes:
-      - ./data:/data
-    restart: "no"
-
-  formatter:
-    build: ./agents/formatter
-    container_name: agent_formatter
-    user: "1000:1000"
-    depends_on:
-      prioritizer:
-        condition: service_completed_successfully
+      OLLAMA_HOST: http://127.0.0.1:11434
+      OLLAMA_MODEL: llama3:latest
+      MAX_STEPS: "6"
+      SYSTEM_PROMPT: >-
+        You are an Azure DevOps pipeline log analysis agent. You do not receive
+        the full log directly. Use the available tools to inspect only the parts
+        you need. Start from compact tools such as get_log_overview,
+        find_failure_markers, top_error_signatures, or likely_root_cause, and
+        use search_logs or get_log_excerpt only when you need more evidence. Do
+        not invent evidence. Keep evidence short and cite line numbers when
+        possible. When you have enough information, return one valid JSON object
+        only with these keys: summary, top_failure_pattern, likely_root_cause,
+        confidence, evidence, next_checks. The confidence value must be one of:
+        high, medium, low. The evidence and next_checks values must be arrays of
+        short strings.
+    command:
+      - --log-file
+      - /data/input/pipeline.log
+      - --question
+      - Analyze why this Azure DevOps pipeline failed and suggest the next checks.
+      - --output-file
+      - /output/analysis.md
+      - --max-steps
+      - "6"
     volumes:
       - ./data:/data
       - ./output:/output

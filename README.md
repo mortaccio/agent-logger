@@ -1,145 +1,183 @@
-# Multi-Agent Daily Digest (Personal)
+# Agentic Pipeline Log Analyzer
 
-Small personal pipeline that turns text notes into a daily markdown digest using 4 Dockerized agents:
+Minimal practical MVP for Azure DevOps pipeline log analysis with Ollama.
 
-1. `ingestor` reads all files from `data/input/`
-2. `summarizer` sends combined text to local Ollama (with optional prediction logic)
-3. `prioritizer` scores lines by urgency keywords
-4. `formatter` writes `output/daily_digest.md`
+The main runtime path is now a single containerized log agent:
 
-## Requirements
+- input: `pipeline.log` or any plain text log file
+- execution: Python + deterministic tools + Ollama `/api/chat`
+- output: `analysis.md` or `analysis.json`
 
-- Linux/WSL/macOS with Docker + Docker Compose
-- Ollama installed locally
-- A local Ollama model: `llama3:latest`
+## Current Repo Status
 
-## Install Ollama
+Current repo structure after the upgrade:
 
-Use the official method for your OS:
+- `agents/summarizer/`
+  - primary agentic log analyzer
+  - contains CLI, Ollama integration, tool loop, Docker assets
+- `examples/azure-pipelines.failed-log-agent.yml`
+  - example Azure DevOps integration
 
-- Linux / WSL (Debian/Ubuntu):
+## What Was Added
 
-```bash
-curl -fsSL https://ollama.com/install.sh | sh
-```
+Main additions in `agents/summarizer/`:
 
-- macOS:
-  - Install from: https://ollama.com/download
+- agent loop with Ollama tool calling
+- automatic fallback to prompt-based tool calling for models that do not support native tools
+- deterministic tools for txt logs
+- controlled fallback when Ollama is unavailable
+- CLI for pipeline usage
+- container-friendly Dockerfile + entrypoint
 
-- Windows:
-  - Install from: https://ollama.com/download
+Implemented tools:
 
-After install, start Ollama and pull the model used by this repo:
+- `get_log_overview`
+- `search_logs`
+- `find_failure_markers`
+- `top_error_signatures`
+- `likely_root_cause`
+- `error_timeline`
+- `get_log_excerpt`
 
-```bash
-ollama serve
-ollama pull llama3:latest
-ollama list
-```
+All tools:
 
-Quick health check:
+- are deterministic
+- return structured JSON
+- enforce bounded output
+- avoid shell execution
+- support `limit` / `top_k` style arguments where relevant
 
-```bash
-curl -s http://127.0.0.1:11434/api/tags
-```
+## Where To Edit Prompts
 
-## Project Layout
+Recommended runtime prompt override:
 
-```text
-agents/
-  ingestor/
-  summarizer/
-  prioritizer/
-  formatter/
-data/
-  input/               # put your .txt files here
-output/
-  daily_digest.md      # final result
-docker-compose.yml
-```
+- [docker-compose.yml](/home/asenic/multi-agent-digest/docker-compose.yml)
+  - `services.log-agent.environment.SYSTEM_PROMPT`
 
-## Quick Start
+Default fallback prompt in code:
 
-1. Put your input text files into `data/input/` (for example `notes.txt`, `newsletter.txt`).
-   - Supported now: `.txt`, `.md`, `.log`, `.csv`, `.xlsx`
-2. Run the pipeline:
+- [agents/summarizer/app.py](/home/asenic/multi-agent-digest/agents/summarizer/app.py)
+  - `DEFAULT_SYSTEM_PROMPT`
+  - `SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT", ...)`
 
-```bash
-docker compose up --build
-```
+## Ollama Config
 
-3. Open the result:
+The agent does not hardcode the active Ollama endpoint or model.
 
-```bash
-cat output/daily_digest.md
-```
+It reads them from:
 
-## Configuration
+- CLI: `--model`, `--ollama-host`, `--ollama-url`
+- env: `OLLAMA_MODEL`, `OLLAMA_HOST`, `OLLAMA_URL`
 
-Current summarizer settings are in `docker-compose.yml`:
+If Ollama is unavailable, the agent writes a controlled fallback analysis instead of crashing.
+If the selected model does not support native Ollama `tools`, the agent automatically switches to a JSON-based compatibility loop and keeps using the same Python tools.
 
-- `OLLAMA_URL=http://127.0.0.1:11434/api/generate`
-- `OLLAMA_MODEL=llama3:latest`
-- `ENABLE_PREDICTION=true`
-- `PREDICTIVE_PROMPT=...`
-
-Current ingestor setting:
-
-- `MAX_TABLE_ROWS=200` (truncate large CSV/XLSX tables)
-
-If you want a different model, pull it first and then change `OLLAMA_MODEL`.
-If you want different forecasting behavior, edit `PREDICTIVE_PROMPT`.
-
-Note: `.env` includes `OPENAI_API_KEY`, but the current summarizer flow uses Ollama and does not require OpenAI.
-
-## Prediction Inputs (Simple)
-
-If you want "predict next value if possible":
-
-1. Put a table file in `data/input/` (for example `sales.xlsx` or `sales.csv`).
-2. Run `docker compose up --build`.
-3. Check `data/summary.txt` and `output/daily_digest.md`.
-
-The summarizer will try to infer trend and output a prediction section.
-If data is not enough, it should explicitly say prediction is not reliable.
-
-## Troubleshooting
-
-### `Ollama error: <urlopen error [Errno 111] Connection refused>`
-
-This means the summarizer container cannot reach Ollama.
-
-Check:
+## Local CLI Usage
 
 ```bash
-ollama list
-curl -s http://127.0.0.1:11434/api/tags
+python3 agents/summarizer/app.py \
+  --log-file data/input/pipeline.log \
+  --output-file output/analysis.md \
+  --question "Analyze why this Azure DevOps pipeline failed and suggest the next checks." \
+  --model llama3:latest \
+  --ollama-host http://127.0.0.1:11434 \
+  --max-steps 6
 ```
 
-If needed, restart Ollama:
+JSON output:
 
 ```bash
-pkill ollama || true
-ollama serve
+python3 agents/summarizer/app.py \
+  --log-file data/input/pipeline.log \
+  --output-file output/analysis.json \
+  --model llama3:latest \
+  --ollama-host http://127.0.0.1:11434
 ```
 
-Then rerun:
+## Docker Compose
+
+Primary compose service:
+
+- [docker-compose.yml](/home/asenic/multi-agent-digest/docker-compose.yml)
+
+Default compose run:
 
 ```bash
 docker compose up --build
 ```
 
-### Permission denied when saving `output/daily_digest.md`
+By default it expects:
 
-Containers run as UID/GID `1000:1000` in this repo to keep generated files writable in WSL/Linux.
-If ownership was broken by older runs:
+- input log: `data/input/pipeline.log`
+- output file: `output/analysis.md`
+
+## Docker Image Details
+
+Runtime files:
+
+- [agents/summarizer/Dockerfile](/home/asenic/multi-agent-digest/agents/summarizer/Dockerfile)
+- [agents/summarizer/entrypoint.sh](/home/asenic/multi-agent-digest/agents/summarizer/entrypoint.sh)
+- [agents/summarizer/requirements.txt](/home/asenic/multi-agent-digest/agents/summarizer/requirements.txt)
+
+Container properties:
+
+- runs as non-root user
+- compose maps container UID/GID to the host by default
+- reads logs from mounted volume
+- writes analysis into mounted output directory
+
+## Azure DevOps Example
+
+Example failed-pipeline integration:
+
+- [examples/azure-pipelines.failed-log-agent.yml](/home/asenic/multi-agent-digest/examples/azure-pipelines.failed-log-agent.yml)
+
+The example assumes:
+
+- `pipeline.log` is already available in `$(Pipeline.Workspace)/pipeline.log`
+- the job has Docker access
+- `OLLAMA_HOST` and `OLLAMA_MODEL` are available as pipeline variables
+
+The example:
+
+- runs only on `failed()`
+- mounts the log into the container
+- writes `analysis.md`
+- publishes the result as an artifact
+
+## Output Shape
+
+The final analysis is normalized to:
+
+- `summary`
+- `top_failure_pattern`
+- `likely_root_cause`
+- `confidence`
+- `evidence`
+- `next_checks`
+
+Markdown output is rendered from the same structured result, so `md` and `json` stay aligned.
+
+## Guardrails
+
+Implemented guardrails:
+
+- LLM sees log metadata first, not the full raw log
+- tool outputs are bounded and truncated
+- excerpts are line-limited
+- common secrets/tokens are masked
+- no tool is allowed to execute arbitrary shell commands
+- tool failures return structured error payloads
+
+## Tests
+
+Run all tests:
 
 ```bash
-chown -R 1000:1000 data output
+pytest -q
 ```
 
-## Optional: Run test
+Current tests cover:
 
-```bash
-pytest -q tests/test-prioritizer.py
-```
+- deterministic log tools
+- fallback analysis shaping

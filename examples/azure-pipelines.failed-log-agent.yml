@@ -1,0 +1,29 @@
+steps:
+  - bash: |
+      set -eu
+      mkdir -p "$(Pipeline.Workspace)/log-agent-input"
+      mkdir -p "$(Build.ArtifactStagingDirectory)/log-agent"
+
+      cp "$(Pipeline.Workspace)/pipeline.log" \
+        "$(Pipeline.Workspace)/log-agent-input/pipeline.log"
+
+      docker build -t local/log-agent ./agents/summarizer
+
+      docker run --rm --network host \
+        --user "$(id -u):$(id -g)" \
+        -e OLLAMA_HOST="$(OLLAMA_HOST)" \
+        -e OLLAMA_MODEL="$(OLLAMA_MODEL)" \
+        -e MAX_STEPS="6" \
+        -v "$(Pipeline.Workspace)/log-agent-input:/data/input:ro" \
+        -v "$(Build.ArtifactStagingDirectory)/log-agent:/output" \
+        local/log-agent \
+        --log-file /data/input/pipeline.log \
+        --output-file /output/analysis.md \
+        --question "Analyze why this Azure DevOps pipeline failed and suggest the next checks."
+    displayName: Run log agent on failed pipeline
+    condition: failed()
+
+  - publish: $(Build.ArtifactStagingDirectory)/log-agent
+    artifact: pipeline-log-analysis
+    displayName: Publish log agent artifact
+    condition: always()
