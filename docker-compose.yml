@@ -5,9 +5,20 @@ services:
     user: "${LOCAL_UID:-1000}:${LOCAL_GID:-1000}"
     network_mode: "host"
     environment:
+      LOG_URL: http://localhost:8080/job/petclinic%20pipeline/lastBuild/consoleText
+      LOG_SOURCE_USERNAME: ${LOG_SOURCE_USERNAME:-}
+      LOG_SOURCE_PASSWORD: ${LOG_SOURCE_PASSWORD:-}
+      LOG_SOURCE_AUTH_HEADER: ${LOG_SOURCE_AUTH_HEADER:-}
+      OUTPUT_FILE: /output/analysis.md
       OLLAMA_HOST: http://127.0.0.1:11434
       OLLAMA_MODEL: llama3:latest
       MAX_STEPS: "6"
+      POLL_INTERVAL_SECONDS: "30"
+      STATE_FILE: /output/.log-agent-state.json
+      AGENT_QUESTION: >-
+        Analyze the latest pipeline run log. Explain whether the run failed or
+        succeeded, identify the top failure pattern if any, the likely root
+        cause, concise evidence, next checks, and practical remediation steps.
       SYSTEM_PROMPT: >-
         You are an Azure DevOps pipeline log analysis agent. You do not receive
         the full log directly. Use the available tools to inspect only the parts
@@ -20,16 +31,6 @@ services:
         confidence, evidence, next_checks. The confidence value must be one of:
         high, medium, low. The evidence and next_checks values must be arrays of
         short strings.
-    command:
-      - --log-file
-      - /data/input/pipeline.log
-      - --question
-      - Analyze why this Azure DevOps pipeline failed and suggest the next checks.
-      - --output-file
-      - /output/analysis.md
-      - --max-steps
-      - "6"
     volumes:
-      - ./data:/data
       - ./output:/output
-    restart: "no"
+    restart: unless-stopped

@@ -78,7 +78,7 @@ def test_fallback_analysis_and_markdown_render(tmp_path):
     analysis = build_fallback_analysis(tools)
     report = {
         "status": "partial",
-        "log_file": str(log_path),
+        "log_source": str(log_path),
         "model": "llama3:latest",
         "steps_used": 2,
         "max_steps": 6,

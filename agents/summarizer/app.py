@@ -1,11 +1,17 @@
 import argparse
+import base64
+import hashlib
 import json
 import logging
 import os
 import re
+import tempfile
+import time
 import urllib.error
 import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 
 from log_tools import LogTools
 
@@ -36,6 +42,8 @@ DEFAULT_SYSTEM_PROMPT = (
 SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT", DEFAULT_SYSTEM_PROMPT)
 OLLAMA_TIMEOUT_SEC = int(os.getenv("OLLAMA_TIMEOUT_SEC", "180"))
 MAX_STEPS_DEFAULT = int(os.getenv("MAX_STEPS", "6"))
+REMOTE_SOURCE_TIMEOUT_SEC = int(os.getenv("LOG_SOURCE_TIMEOUT_SEC", "60"))
+POLL_INTERVAL_DEFAULT = int(os.getenv("POLL_INTERVAL_SECONDS", "0"))
 COMPAT_TOOL_PROTOCOL = (
     "Native Ollama tool calling is unavailable for this model. "
     "Use this JSON protocol instead. Return exactly one JSON object per turn and "
@@ -60,7 +68,11 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="Container-friendly agentic log analyzer for logs."
     )
-    parser.add_argument("--log-file", required=True, help="Path to the pipeline log file.")
+    parser.add_argument("--log-file", help="Path to the pipeline log file.")
+    parser.add_argument(
+        "--log-url",
+        help="HTTP/HTTPS URL for the latest plain text pipeline log, for example Jenkins consoleText.",
+    )
     parser.add_argument(
         "--question",
         default=os.getenv("AGENT_QUESTION", DEFAULT_QUESTION),
@@ -68,7 +80,7 @@ def parse_args():
     )
     parser.add_argument(
         "--output-file",
-        required=True,
+        default=os.getenv("OUTPUT_FILE"),
         help="Output file path. Use .md or .json.",
     )
     parser.add_argument(
@@ -92,7 +104,62 @@ def parse_args():
         default=MAX_STEPS_DEFAULT,
         help="Maximum number of LLM interaction steps.",
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--poll-interval-seconds",
+        type=int,
+        default=POLL_INTERVAL_DEFAULT,
+        help="When used with --log-url, poll for new runs every N seconds. Use 0 for one-shot mode.",
+    )
+    parser.add_argument(
+        "--state-file",
+        default=os.getenv("STATE_FILE"),
+        help="Optional JSON state file used to remember the last processed remote run.",
+    )
+    parser.add_argument(
+        "--source-timeout-sec",
+        type=int,
+        default=REMOTE_SOURCE_TIMEOUT_SEC,
+        help="HTTP timeout for fetching remote logs and build metadata.",
+    )
+    parser.add_argument(
+        "--source-username",
+        default=os.getenv("LOG_SOURCE_USERNAME") or os.getenv("JENKINS_USERNAME"),
+        help="Optional username for authenticated remote log fetch.",
+    )
+    parser.add_argument(
+        "--source-password",
+        default=(
+            os.getenv("LOG_SOURCE_PASSWORD")
+            or os.getenv("LOG_SOURCE_API_TOKEN")
+            or os.getenv("JENKINS_API_TOKEN")
+            or os.getenv("JENKINS_TOKEN")
+        ),
+        help="Optional password or API token for authenticated remote log fetch.",
+    )
+    parser.add_argument(
+        "--source-auth-header",
+        default=os.getenv("LOG_SOURCE_AUTH_HEADER"),
+        help="Optional full Authorization header value for the remote log source.",
+    )
+
+    args = parser.parse_args()
+    args.log_file = args.log_file or os.getenv("LOG_FILE")
+    args.log_url = args.log_url or os.getenv("LOG_URL")
+
+    if not args.log_file and not args.log_url:
+        parser.error("one of --log-file or --log-url is required")
+    if args.log_file and args.log_url:
+        parser.error("use either --log-file or --log-url, not both")
+    if not args.output_file:
+        parser.error("--output-file is required or set OUTPUT_FILE")
+    if args.poll_interval_seconds < 0:
+        parser.error("--poll-interval-seconds must be zero or a positive integer")
+    if args.log_file and args.poll_interval_seconds:
+        parser.error("--poll-interval-seconds can only be used with --log-url")
+    if args.source_timeout_sec <= 0:
+        parser.error("--source-timeout-sec must be a positive integer")
+
+    return args
 
 
 def resolve_ollama_chat_url(ollama_host=None, ollama_url=None):
@@ -112,12 +179,204 @@ def resolve_ollama_chat_url(ollama_host=None, ollama_url=None):
     return url.rstrip("/") + "/api/chat"
 
 
-def build_user_message(question, overview):
+def build_source_headers(source_username=None, source_password=None, source_auth_header=None):
+    headers = {"User-Agent": "log-agent/1.0"}
+    if source_auth_header:
+        headers["Authorization"] = source_auth_header.strip()
+        return headers
+
+    if source_username and source_password:
+        token = base64.b64encode(f"{source_username}:{source_password}".encode("utf-8")).decode(
+            "ascii"
+        )
+        headers["Authorization"] = f"Basic {token}"
+    return headers
+
+
+def build_fetch_error_message(url, status_code=None, detail=None, transport_error=None):
+    if transport_error:
+        return f"Failed to fetch {url}: {transport_error}"
+
+    compact_detail = re.sub(r"\s+", " ", detail or "").strip()
+    lowered = compact_detail.lower()
+    if status_code in {401, 403} and (
+        "authentication required" in lowered
+        or "/login" in lowered
+        or "unauthorized" in lowered
+        or "forbidden" in lowered
+    ):
+        return (
+            f"Failed to fetch {url}: authentication required. "
+            "Configure LOG_SOURCE_USERNAME/LOG_SOURCE_PASSWORD or LOG_SOURCE_AUTH_HEADER."
+        )
+
+    if compact_detail:
+        if len(compact_detail) > 240:
+            compact_detail = compact_detail[:240] + "..."
+        return f"Failed to fetch {url}: HTTP {status_code}: {compact_detail}"
+
+    if status_code is not None:
+        return f"Failed to fetch {url}: HTTP {status_code}"
+    return f"Failed to fetch {url}"
+
+
+def fetch_text_url(url, timeout_sec, request_headers=None):
+    request = urllib.request.Request(
+        url=url,
+        headers=request_headers or {"User-Agent": "log-agent/1.0"},
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout_sec) as response:
+            content = response.read().decode("utf-8", errors="replace")
+            headers = {key.lower(): value for key, value in response.headers.items()}
+            final_url = response.geturl()
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(build_fetch_error_message(url, status_code=exc.code, detail=detail)) from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(build_fetch_error_message(url, transport_error=str(exc))) from exc
+    except TimeoutError as exc:
+        raise RuntimeError(f"Timed out while fetching {url}") from exc
+    return content, headers, final_url
+
+
+def derive_jenkins_api_url(log_url):
+    parts = urlsplit(log_url)
+    if not parts.path.endswith("/consoleText"):
+        return None
+    api_path = parts.path[: -len("/consoleText")] + "/api/json"
+    return urlunsplit((parts.scheme, parts.netloc, api_path, parts.query, parts.fragment))
+
+
+def fetch_jenkins_build_info(log_url, timeout_sec, request_headers=None):
+    api_url = derive_jenkins_api_url(log_url)
+    if not api_url:
+        return {}
+
+    try:
+        payload_text, _, _ = fetch_text_url(api_url, timeout_sec, request_headers=request_headers)
+    except RuntimeError:
+        return {}
+
+    try:
+        payload = json.loads(payload_text)
+    except json.JSONDecodeError:
+        return {}
+
+    if not isinstance(payload, dict):
+        return {}
+
+    number = payload.get("number")
+    if not isinstance(number, int):
+        number = None
+
+    return {
+        "number": number,
+        "building": bool(payload.get("building", False)),
+        "result": payload.get("result"),
+        "url": payload.get("url"),
+        "full_display_name": payload.get("fullDisplayName"),
+    }
+
+
+def build_remote_source_id(log_text, headers, build_info):
+    content_hash = hashlib.sha256(log_text.encode("utf-8")).hexdigest()
+    if build_info.get("number") is not None:
+        return f"jenkins-build:{build_info['number']}"
+    etag = headers.get("etag")
+    if etag:
+        return f"etag:{etag}"
+    last_modified = headers.get("last-modified")
+    if last_modified:
+        return f"last-modified:{last_modified}:{content_hash[:12]}"
+    return f"sha256:{content_hash}"
+
+
+def build_remote_source_label(log_url, build_info):
+    number = build_info.get("number")
+    result = build_info.get("result")
+    if number is None and not result and not build_info.get("building"):
+        return log_url
+
+    parts = []
+    if number is not None:
+        parts.append(f"build #{number}")
+    if build_info.get("building"):
+        parts.append("building")
+    elif isinstance(result, str) and result:
+        parts.append(f"result={result}")
+    return f"{log_url} [{', '.join(parts)}]"
+
+
+def default_state_path(output_file):
+    output_path = Path(output_file)
+    return output_path.parent / ".log-agent-state.json"
+
+
+def load_state(state_path):
+    if not state_path.exists():
+        return {}
+    try:
+        payload = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def save_state(state_path, payload):
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(json.dumps(payload, ensure_ascii=True, indent=2) + "\n", encoding="utf-8")
+
+
+def fetch_remote_log_source(log_url, timeout_sec, request_headers=None):
+    content, headers, final_url = fetch_text_url(log_url, timeout_sec, request_headers=request_headers)
+    build_info = fetch_jenkins_build_info(final_url, timeout_sec, request_headers=request_headers)
+    return {
+        "content": content,
+        "source_id": build_remote_source_id(content, headers, build_info),
+        "source_label": build_remote_source_label(final_url, build_info),
+        "build_info": build_info,
+    }
+
+
+def build_source_context(log_source, build_info=None):
+    build_info = build_info or {}
+    build_result = build_info.get("result")
+    if isinstance(build_result, str):
+        build_result = build_result.strip().upper() or None
+    else:
+        build_result = None
+
+    build_number = build_info.get("number")
+    if not isinstance(build_number, int):
+        build_number = None
+
+    return {
+        "log_source": str(log_source),
+        "build_result": build_result,
+        "build_number": build_number,
+        "building": bool(build_info.get("building", False)),
+    }
+
+
+def build_user_message(question, overview, source_context=None):
     compact_overview = json.dumps(overview, ensure_ascii=True, indent=2)
+    compact_source_context = json.dumps(source_context or {}, ensure_ascii=True, indent=2)
+    extra_instruction = ""
+    if (source_context or {}).get("build_result") == "SUCCESS":
+        extra_instruction = (
+            "External CI metadata says this run finished with SUCCESS. "
+            "Do not report a pipeline failure unless you find direct build-level evidence "
+            "that contradicts that result."
+        )
     return (
         f"Question:\n{question}\n\n"
+        "External source context:\n"
+        f"{compact_source_context}\n\n"
         "Log metadata and initial overview:\n"
         f"{compact_overview}\n\n"
+        f"{extra_instruction}\n\n"
         "Use tools when you need more detail. Return JSON only when done."
     )
 
@@ -136,16 +395,26 @@ def build_tool_catalog(tool_schemas):
     return catalog
 
 
-def build_compat_user_message(question, overview, tool_catalog):
+def build_compat_user_message(question, overview, tool_catalog, source_context=None):
     compact_overview = json.dumps(overview, ensure_ascii=True, indent=2)
     compact_catalog = json.dumps(tool_catalog, ensure_ascii=True, indent=2)
+    compact_source_context = json.dumps(source_context or {}, ensure_ascii=True, indent=2)
+    extra_instruction = ""
+    if (source_context or {}).get("build_result") == "SUCCESS":
+        extra_instruction = (
+            "External CI metadata says this run finished with SUCCESS. "
+            "Do not claim a pipeline failure unless tool results contain direct contradictory evidence."
+        )
     return (
         f"Question:\n{question}\n\n"
         f"{COMPAT_TOOL_PROTOCOL}\n\n"
         "Available tools:\n"
         f"{compact_catalog}\n\n"
+        "External source context:\n"
+        f"{compact_source_context}\n\n"
         "Log metadata and initial overview:\n"
         f"{compact_overview}\n\n"
+        f"{extra_instruction}\n\n"
         "Select the next best tool or return the final analysis."
     )
 
@@ -341,7 +610,70 @@ def unique_preserve_order(items):
     return ordered
 
 
-def build_fallback_analysis(log_tools):
+def build_success_analysis(log_tools, source_context=None):
+    source_context = source_context or {}
+    overview = log_tools.get_log_overview(limit=5)
+    markers = log_tools.find_failure_markers(limit=5)
+    signatures = log_tools.top_error_signatures(top_k=1, min_occurrences=1)
+
+    marker_total = sum(markers.get("counts_by_type", {}).values())
+    line_count = overview.get("line_count", 0)
+    build_number = source_context.get("build_number")
+    build_label = f"build #{build_number}" if build_number is not None else "the latest build"
+
+    top_signature = ""
+    if signatures.get("signatures"):
+        top_signature = signatures["signatures"][0]["signature"]
+
+    notable_marker = None
+    if markers.get("top_matches"):
+        notable_marker = markers["top_matches"][0]
+    elif markers.get("matches"):
+        notable_marker = markers["matches"][0]
+
+    evidence = [f"External CI metadata reports {build_label} finished with SUCCESS."]
+    if notable_marker and notable_marker.get("line_number"):
+        evidence.append(
+            f"Error-like log content exists at line {notable_marker['line_number']}, but it did not fail the Jenkins run."
+        )
+    if top_signature:
+        evidence.append(f"Most notable error-like signature inside the log: {top_signature}")
+
+    next_checks = []
+    if notable_marker and notable_marker.get("line_number"):
+        next_checks.append(
+            f"Review lines around {notable_marker['line_number']} to confirm the exception is expected runtime or test behavior."
+        )
+    if top_signature:
+        next_checks.append(
+            f"If this signature is unexpected, add assertions or exit-code propagation for: {top_signature}"
+        )
+    next_checks.append(
+        "If this run should have failed, verify the pipeline step returns a non-zero exit code when the application/test exception occurs."
+    )
+
+    analysis = {
+        "summary": (
+            f"External CI metadata reports {build_label} completed with SUCCESS. "
+            f"The log still contains {marker_total} error-like markers across {line_count} lines, "
+            "but they did not cause a pipeline failure."
+        ),
+        "top_failure_pattern": "No pipeline failure detected; external build result is SUCCESS.",
+        "likely_root_cause": (
+            "No pipeline failure was detected. Error-like log lines appear to come from application, "
+            "test, or demo runtime output captured during a successful run."
+        ),
+        "confidence": "high",
+        "evidence": unique_preserve_order(evidence)[:5],
+        "next_checks": unique_preserve_order(next_checks)[:5],
+    }
+    return normalize_analysis(analysis, analysis)
+
+
+def build_fallback_analysis(log_tools, source_context=None):
+    if (source_context or {}).get("build_result") == "SUCCESS":
+        return build_success_analysis(log_tools, source_context)
+
     overview = log_tools.get_log_overview(limit=5)
     markers = log_tools.find_failure_markers(limit=8)
     signatures = log_tools.top_error_signatures(top_k=3, min_occurrences=1)
@@ -413,7 +745,7 @@ def build_fallback_analysis(log_tools):
 
 def build_report(
     *,
-    log_file,
+    log_source,
     question,
     output_file,
     model,
@@ -428,7 +760,7 @@ def build_report(
     return {
         "status": status,
         "question": question,
-        "log_file": str(log_file),
+        "log_source": str(log_source),
         "output_file": str(output_file),
         "model": model,
         "ollama_chat_url": ollama_chat_url,
@@ -446,7 +778,7 @@ def render_markdown(report):
         "# Pipeline Failure Analysis",
         "",
         f"- Status: {report['status']}",
-        f"- Log file: `{report['log_file']}`",
+        f"- Log source: `{report['log_source']}`",
         f"- Model: `{report['model'] or 'not-used'}`",
         f"- Steps used: {report['steps_used']}/{report['max_steps']}",
     ]
@@ -506,9 +838,12 @@ def write_report(report, output_file):
     output_path.write_text(render_markdown(report), encoding="utf-8")
 
 
-def run_agent(log_tools, question, model, ollama_chat_url, max_steps):
-    fallback = build_fallback_analysis(log_tools)
+def run_agent(log_tools, question, model, ollama_chat_url, max_steps, source_context=None):
+    fallback = build_fallback_analysis(log_tools, source_context=source_context)
     tool_trace = []
+
+    if (source_context or {}).get("build_result") == "SUCCESS":
+        return "ok", fallback, tool_trace, 0, None
 
     if not model:
         return "degraded", fallback, tool_trace, 0, "OLLAMA_MODEL is not set; wrote deterministic fallback analysis."
@@ -518,7 +853,10 @@ def run_agent(log_tools, question, model, ollama_chat_url, max_steps):
     overview = log_tools.get_log_overview(limit=5)
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": build_user_message(question, overview)},
+        {
+            "role": "user",
+            "content": build_user_message(question, overview, source_context=source_context),
+        },
     ]
     tool_schemas = log_tools.get_tool_schemas()
     last_error = None
@@ -539,6 +877,7 @@ def run_agent(log_tools, question, model, ollama_chat_url, max_steps):
                     ollama_chat_url=ollama_chat_url,
                     max_steps=max_steps,
                     fallback=fallback,
+                    source_context=source_context,
                 )
             last_error = str(exc)
             logger.error(last_error)
@@ -602,14 +941,30 @@ def run_agent(log_tools, question, model, ollama_chat_url, max_steps):
     return "partial", fallback, tool_trace, max_steps, last_error
 
 
-def run_agent_compat(log_tools, question, model, ollama_chat_url, max_steps, fallback):
+def run_agent_compat(
+    log_tools,
+    question,
+    model,
+    ollama_chat_url,
+    max_steps,
+    fallback,
+    source_context=None,
+):
     tool_trace = []
     tool_schemas = log_tools.get_tool_schemas()
     tool_catalog = build_tool_catalog(tool_schemas)
     overview = log_tools.get_log_overview(limit=5)
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": build_compat_user_message(question, overview, tool_catalog)},
+        {
+            "role": "user",
+            "content": build_compat_user_message(
+                question,
+                overview,
+                tool_catalog,
+                source_context=source_context,
+            ),
+        },
     ]
 
     for step in range(1, max_steps + 1):
@@ -676,9 +1031,7 @@ def run_agent_compat(log_tools, question, model, ollama_chat_url, max_steps, fal
     return "partial", fallback, tool_trace, max_steps, error_message
 
 
-def main():
-    args = parse_args()
-    log_path = Path(args.log_file)
+def analyze_log_path(log_path, log_source, args, source_context=None):
     output_path = Path(args.output_file)
 
     if not log_path.exists():
@@ -698,10 +1051,11 @@ def main():
         model=args.model,
         ollama_chat_url=ollama_chat_url,
         max_steps=max_steps,
+        source_context=source_context,
     )
 
     report = build_report(
-        log_file=log_path,
+        log_source=log_source,
         question=args.question,
         output_file=output_path,
         model=args.model,
@@ -723,6 +1077,127 @@ def main():
         return 1
     logger.info("Analysis written to %s", output_path)
     return 0
+
+
+def analyze_log_text(log_text, log_source, args, source_context=None):
+    with tempfile.TemporaryDirectory(prefix="log-agent-") as temp_dir:
+        temp_path = Path(temp_dir) / "pipeline.log"
+        temp_path.write_text(log_text, encoding="utf-8")
+        return analyze_log_path(temp_path, log_source, args, source_context=source_context)
+
+
+def run_remote_once(args):
+    request_headers = build_source_headers(
+        source_username=args.source_username,
+        source_password=args.source_password,
+        source_auth_header=args.source_auth_header,
+    )
+    source = fetch_remote_log_source(
+        args.log_url,
+        args.source_timeout_sec,
+        request_headers=request_headers,
+    )
+    source_context = build_source_context(source["source_label"], source["build_info"])
+    return analyze_log_text(
+        source["content"],
+        source["source_label"],
+        args,
+        source_context=source_context,
+    )
+
+
+def watch_remote_log_source(args):
+    state_path = Path(args.state_file) if args.state_file else default_state_path(args.output_file)
+    state = load_state(state_path)
+    last_processed_id = state.get("last_processed_id")
+    request_headers = build_source_headers(
+        source_username=args.source_username,
+        source_password=args.source_password,
+        source_auth_header=args.source_auth_header,
+    )
+
+    logger.info(
+        "Watching %s for new runs every %d seconds",
+        args.log_url,
+        args.poll_interval_seconds,
+    )
+    logger.info("State file: %s", state_path)
+
+    while True:
+        try:
+            source = fetch_remote_log_source(
+                args.log_url,
+                args.source_timeout_sec,
+                request_headers=request_headers,
+            )
+        except RuntimeError as exc:
+            logger.error("%s", exc)
+            time.sleep(args.poll_interval_seconds)
+            continue
+
+        build_info = source["build_info"]
+        build_number = build_info.get("number")
+
+        if build_info.get("building"):
+            if build_number is not None:
+                logger.info("Latest run #%s is still in progress; waiting for completion.", build_number)
+            else:
+                logger.info("Latest run is still in progress; waiting for completion.")
+            time.sleep(args.poll_interval_seconds)
+            continue
+
+        if source["source_id"] == last_processed_id:
+            if build_number is not None:
+                logger.info("No new completed run detected. Last processed build: #%s", build_number)
+            else:
+                logger.info("No new completed run detected for %s", args.log_url)
+            time.sleep(args.poll_interval_seconds)
+            continue
+
+        logger.info("Processing new run from %s", source["source_label"])
+        source_context = build_source_context(source["source_label"], source["build_info"])
+        exit_code = analyze_log_text(
+            source["content"],
+            source["source_label"],
+            args,
+            source_context=source_context,
+        )
+        if exit_code == 0:
+            last_processed_id = source["source_id"]
+            save_state(
+                state_path,
+                {
+                    "last_processed_id": last_processed_id,
+                    "log_url": args.log_url,
+                    "source_label": source["source_label"],
+                    "build_number": build_number,
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                },
+            )
+
+        time.sleep(args.poll_interval_seconds)
+
+
+def main():
+    args = parse_args()
+
+    if args.log_file:
+        log_path = Path(args.log_file)
+        return analyze_log_path(log_path, str(log_path), args)
+
+    if args.poll_interval_seconds > 0:
+        try:
+            watch_remote_log_source(args)
+        except KeyboardInterrupt:
+            logger.info("Stopping remote watcher.")
+            return 0
+        return 0
+
+    try:
+        return run_remote_once(args)
+    except RuntimeError as exc:
+        logger.error("%s", exc)
+        return 1
 
 
 if __name__ == "__main__":

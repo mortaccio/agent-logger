@@ -1,6 +1,7 @@
 import importlib.util
 import json
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -106,3 +107,90 @@ def test_run_agent_falls_back_to_compat_mode_when_model_lacks_native_tools(tmp_p
 def test_is_unsupported_tools_error(detail, expected):
     error = APP_MODULE.OllamaRequestError("test", status_code=400, detail=detail)
     assert APP_MODULE.is_unsupported_tools_error(error) is expected
+
+
+def test_derive_jenkins_api_url():
+    url = "http://localhost:8080/job/petclinic%20pipeline/lastBuild/consoleText"
+    assert (
+        APP_MODULE.derive_jenkins_api_url(url)
+        == "http://localhost:8080/job/petclinic%20pipeline/lastBuild/api/json"
+    )
+
+
+def test_fetch_remote_log_source_uses_jenkins_build_number(monkeypatch):
+    def fake_fetch_text_url(url, timeout_sec, request_headers=None):
+        if url.endswith("/consoleText"):
+            return "build log text", {"etag": "abc123"}, url
+        return json.dumps({"number": 51, "building": False, "result": "FAILURE"}), {}, url
+
+    monkeypatch.setattr(APP_MODULE, "fetch_text_url", fake_fetch_text_url)
+
+    source = APP_MODULE.fetch_remote_log_source(
+        "http://localhost:8080/job/petclinic%20pipeline/lastBuild/consoleText",
+        timeout_sec=5,
+    )
+
+    assert source["source_id"] == "jenkins-build:51"
+    assert source["source_label"].endswith("[build #51, result=FAILURE]")
+    assert source["build_info"]["number"] == 51
+
+
+def test_build_source_headers_uses_basic_auth():
+    headers = APP_MODULE.build_source_headers(
+        source_username="ci-bot",
+        source_password="top-secret-token",
+    )
+
+    assert headers["User-Agent"] == "log-agent/1.0"
+    assert headers["Authorization"].startswith("Basic ")
+
+
+def test_build_fetch_error_message_for_auth_failure():
+    message = APP_MODULE.build_fetch_error_message(
+        "http://localhost:8080/job/petclinic%20pipeline/lastBuild/consoleText",
+        status_code=403,
+        detail="Authentication required <a href='/login'>login</a>",
+    )
+
+    assert "authentication required" in message.lower()
+    assert "LOG_SOURCE_USERNAME/LOG_SOURCE_PASSWORD" in message
+
+
+def test_run_agent_short_circuits_successful_build(monkeypatch, tmp_path):
+    log_tools = LogTools(write_log(tmp_path))
+
+    def should_not_call_ollama(*args, **kwargs):
+        raise AssertionError("Ollama should not be called for a Jenkins SUCCESS build")
+
+    monkeypatch.setattr(APP_MODULE, "call_ollama_chat", should_not_call_ollama)
+
+    status, analysis, tool_trace, steps_used, error_message = APP_MODULE.run_agent(
+        log_tools=log_tools,
+        question="Analyze the run",
+        model="llama3:latest",
+        ollama_chat_url="http://127.0.0.1:11434/api/chat",
+        max_steps=6,
+        source_context={"build_result": "SUCCESS", "build_number": 11},
+    )
+
+    assert status == "ok"
+    assert error_message is None
+    assert steps_used == 0
+    assert tool_trace == []
+    assert "success" in analysis["summary"].lower()
+    assert "no pipeline failure" in analysis["likely_root_cause"].lower()
+
+
+def test_state_roundtrip(tmp_path):
+    state_path = tmp_path / ".log-agent-state.json"
+    payload = {
+        "last_processed_id": "jenkins-build:77",
+        "log_url": "http://localhost:8080/job/petclinic%20pipeline/lastBuild/consoleText",
+    }
+
+    APP_MODULE.save_state(state_path, payload)
+
+    assert APP_MODULE.load_state(state_path) == payload
+    assert APP_MODULE.default_state_path(tmp_path / "analysis.md") == Path(
+        tmp_path / ".log-agent-state.json"
+    )

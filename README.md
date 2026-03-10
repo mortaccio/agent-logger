@@ -4,7 +4,7 @@ Minimal practical MVP for Azure DevOps pipeline log analysis with Ollama.
 
 The main runtime path is now a single containerized log agent:
 
-- input: `pipeline.log` or any plain text log file
+- input: local `pipeline.log` file or remote `consoleText` URL
 - execution: Python + deterministic tools + Ollama `/api/chat`
 - output: `analysis.md` or `analysis.json`
 
@@ -84,6 +84,21 @@ python3 agents/summarizer/app.py \
   --max-steps 6
 ```
 
+Remote Jenkins `consoleText` source with polling:
+
+```bash
+export LOG_SOURCE_USERNAME=jenkins-user
+export LOG_SOURCE_PASSWORD=jenkins-api-token
+
+python3 agents/summarizer/app.py \
+  --log-url http://localhost:8080/job/petclinic%20pipeline/lastBuild/consoleText \
+  --output-file output/analysis.md \
+  --poll-interval-seconds 30 \
+  --state-file output/.log-agent-state.json \
+  --model llama3:latest \
+  --ollama-host http://127.0.0.1:11434
+```
+
 JSON output:
 
 ```bash
@@ -106,10 +121,16 @@ Default compose run:
 docker compose up --build
 ```
 
-By default it expects:
+By default it watches:
 
-- input log: `data/input/pipeline.log`
+- Jenkins log URL: `http://localhost:8080/job/petclinic%20pipeline/lastBuild/consoleText`
 - output file: `output/analysis.md`
+- state file: `output/.log-agent-state.json`
+
+If Jenkins protects `consoleText`, provide one of:
+
+- `LOG_SOURCE_USERNAME` + `LOG_SOURCE_PASSWORD`
+- `LOG_SOURCE_AUTH_HEADER` with a full `Authorization` header value
 
 ## Docker Image Details
 
