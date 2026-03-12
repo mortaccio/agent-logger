@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import re
+import sys
 import tempfile
 import time
 import urllib.error
@@ -51,10 +52,24 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="Container-friendly agentic log analyzer for logs."
     )
-    parser.add_argument("--log-file", help="Path to the pipeline log file.")
+    parser.add_argument(
+        "--log-source",
+        help=(
+            "Unified log source. Supports local file paths, http(s) URLs, '-' for stdin, "
+            "'file:<path>', 'url:<http(s)://...>', or 'text:<raw log text>'. "
+            "Falls back to LOG_SOURCE."
+        ),
+    )
+    parser.add_argument(
+        "--log-file",
+        help="Legacy alias for a local log file path. Falls back to LOG_FILE.",
+    )
     parser.add_argument(
         "--log-url",
-        help="HTTP/HTTPS URL for the latest plain text pipeline log, for example Jenkins consoleText.",
+        help=(
+            "Legacy alias for an HTTP/HTTPS log URL, for example Jenkins consoleText. "
+            "Falls back to LOG_URL."
+        ),
     )
     parser.add_argument(
         "--question",
@@ -91,7 +106,10 @@ def parse_args():
         "--poll-interval-seconds",
         type=int,
         default=POLL_INTERVAL_DEFAULT,
-        help="When used with --log-url, poll for new runs every N seconds. Use 0 for one-shot mode.",
+        help=(
+            "When used with a remote HTTP/HTTPS log source, poll for new runs every N seconds. "
+            "Use 0 for one-shot mode."
+        ),
     )
     parser.add_argument(
         "--state-file",
@@ -126,23 +144,121 @@ def parse_args():
     )
 
     args = parser.parse_args()
-    args.log_file = args.log_file or os.getenv("LOG_FILE")
-    args.log_url = args.log_url or os.getenv("LOG_URL")
+    args.log_source = resolve_requested_log_source(args, parser)
+    try:
+        args.log_source_spec = resolve_log_source_spec(args.log_source)
+    except ValueError as exc:
+        parser.error(str(exc))
 
-    if not args.log_file and not args.log_url:
-        parser.error("one of --log-file or --log-url is required")
-    if args.log_file and args.log_url:
-        parser.error("use either --log-file or --log-url, not both")
+    args.log_file = None
+    args.log_url = None
+    if args.log_source_spec["kind"] == "local_file":
+        args.log_file = args.log_source_spec["value"]
+    elif args.log_source_spec["kind"] == "remote_url":
+        args.log_url = args.log_source_spec["value"]
     if not args.output_file:
         parser.error("--output-file is required or set OUTPUT_FILE")
     if args.poll_interval_seconds < 0:
         parser.error("--poll-interval-seconds must be zero or a positive integer")
-    if args.log_file and args.poll_interval_seconds:
-        parser.error("--poll-interval-seconds can only be used with --log-url")
+    if args.poll_interval_seconds and args.log_source_spec["kind"] != "remote_url":
+        parser.error("--poll-interval-seconds can only be used with an HTTP/HTTPS log source")
     if args.source_timeout_sec <= 0:
         parser.error("--source-timeout-sec must be a positive integer")
 
     return args
+
+
+def cli_option_supplied(name):
+    prefix = f"{name}="
+    for argument in sys.argv[1:]:
+        if argument == name or argument.startswith(prefix):
+            return True
+    return False
+
+
+def is_http_url(value):
+    if not isinstance(value, str):
+        return False
+    parts = urlsplit(value.strip())
+    return parts.scheme in {"http", "https"} and bool(parts.netloc)
+
+
+def resolve_requested_log_source(args, parser):
+    cli_values = []
+    if cli_option_supplied("--log-source") and args.log_source:
+        cli_values.append("log_source")
+    if cli_option_supplied("--log-file") and args.log_file:
+        cli_values.append("log_file")
+    if cli_option_supplied("--log-url") and args.log_url:
+        cli_values.append("log_url")
+    if len(cli_values) > 1:
+        parser.error("use only one of --log-source, --log-file, or --log-url")
+
+    if "log_source" in cli_values:
+        return args.log_source.strip()
+    if "log_file" in cli_values:
+        return f"file:{args.log_file.strip()}"
+    if "log_url" in cli_values:
+        return f"url:{args.log_url.strip()}"
+
+    env_log_source = os.getenv("LOG_SOURCE")
+    if isinstance(env_log_source, str) and env_log_source.strip():
+        return env_log_source.strip()
+
+    env_log_file = os.getenv("LOG_FILE")
+    if isinstance(env_log_file, str) and env_log_file.strip():
+        return f"file:{env_log_file.strip()}"
+
+    env_log_url = os.getenv("LOG_URL")
+    if isinstance(env_log_url, str) and env_log_url.strip():
+        return f"url:{env_log_url.strip()}"
+
+    parser.error("one of --log-source, --log-file, or --log-url is required")
+
+
+def parse_file_source_value(raw_source):
+    if raw_source.lower().startswith("file://"):
+        parts = urlsplit(raw_source)
+        path = parts.path or ""
+        if parts.netloc:
+            path = f"//{parts.netloc}{path}"
+        return urllib.request.url2pathname(path).strip()
+    return raw_source[5:].strip()
+
+
+def resolve_log_source_spec(log_source):
+    if not isinstance(log_source, str) or not log_source.strip():
+        raise ValueError("log source must be a non-empty string")
+
+    source_text = log_source.strip()
+    lowered = source_text.lower()
+
+    if lowered in {"-", "stdin", "stdin:"}:
+        return {"kind": "stdin", "value": "-", "label": "stdin"}
+
+    if lowered.startswith("text:"):
+        return {
+            "kind": "inline_text",
+            "value": source_text[5:],
+            "label": "inline text",
+        }
+
+    if lowered.startswith("url:"):
+        url = source_text[4:].strip()
+        if not is_http_url(url):
+            raise ValueError("url: sources must use http:// or https://")
+        return {"kind": "remote_url", "value": url, "label": url}
+
+    if lowered.startswith("file:"):
+        path = parse_file_source_value(source_text)
+        if not path:
+            raise ValueError("file: sources must include a path")
+        return {"kind": "local_file", "value": path, "label": path}
+
+    if is_http_url(source_text):
+        return {"kind": "remote_url", "value": source_text, "label": source_text}
+
+    return {"kind": "local_file", "value": source_text, "label": source_text}
 
 
 def resolve_ollama_chat_url(ollama_host=None, ollama_url=None):
@@ -1069,6 +1185,13 @@ def analyze_log_text(log_text, log_source, args, source_context=None):
         return analyze_log_path(temp_path, log_source, args, source_context=source_context)
 
 
+def read_log_from_stdin():
+    log_text = sys.stdin.read()
+    if not log_text.strip():
+        raise RuntimeError("No log content was provided on stdin.")
+    return log_text
+
+
 def run_remote_once(args):
     request_headers = build_source_headers(
         source_username=args.source_username,
@@ -1163,10 +1286,21 @@ def watch_remote_log_source(args):
 
 def main():
     args = parse_args()
+    source_spec = args.log_source_spec
 
-    if args.log_file:
-        log_path = Path(args.log_file)
-        return analyze_log_path(log_path, str(log_path), args)
+    if source_spec["kind"] == "local_file":
+        log_path = Path(source_spec["value"])
+        return analyze_log_path(log_path, source_spec["label"], args)
+
+    if source_spec["kind"] == "inline_text":
+        return analyze_log_text(source_spec["value"], source_spec["label"], args)
+
+    if source_spec["kind"] == "stdin":
+        try:
+            return analyze_log_text(read_log_from_stdin(), source_spec["label"], args)
+        except RuntimeError as exc:
+            logger.error("%s", exc)
+            return 1
 
     if args.poll_interval_seconds > 0:
         try:

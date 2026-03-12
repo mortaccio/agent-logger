@@ -5,7 +5,7 @@ services:
     user: "${LOCAL_UID:-1000}:${LOCAL_GID:-1000}"
     network_mode: "host"
     environment:
-      LOG_URL: http://localhost:8080/job/petclinic%20pipeline/lastBuild/consoleText
+      LOG_SOURCE: http://localhost:8080/job/petclinic%20pipeline/lastBuild/consoleText
       LOG_SOURCE_USERNAME: ${LOG_SOURCE_USERNAME:-}
       LOG_SOURCE_PASSWORD: ${LOG_SOURCE_PASSWORD:-}
       LOG_SOURCE_AUTH_HEADER: ${LOG_SOURCE_AUTH_HEADER:-}
@@ -18,5 +18,6 @@ services:
       AGENT_QUESTION: ${AGENT_QUESTION:-}
       SYSTEM_PROMPT: ${SYSTEM_PROMPT:-}
     volumes:
+      - ./data:/data:ro
       - ./output:/output
     restart: unless-stopped

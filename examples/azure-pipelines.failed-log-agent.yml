@@ -17,7 +17,7 @@ steps:
         -v "$(Pipeline.Workspace)/log-agent-input:/data/input:ro" \
         -v "$(Build.ArtifactStagingDirectory)/log-agent:/output" \
         local/log-agent \
-        --log-file /data/input/pipeline.log \
+        --log-source /data/input/pipeline.log \
         --output-file /output/analysis.md \
         --question "Analyze why this Azure DevOps pipeline failed and suggest the next checks."
     displayName: Run log agent on failed pipeline

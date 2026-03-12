@@ -1,4 +1,5 @@
 import importlib.util
+import io
 import json
 import sys
 from pathlib import Path
@@ -133,6 +134,43 @@ def test_fetch_remote_log_source_uses_jenkins_build_number(monkeypatch):
     assert source["source_id"] == "jenkins-build:51"
     assert source["source_label"].endswith("[build #51, result=FAILURE]")
     assert source["build_info"]["number"] == 51
+
+
+@pytest.mark.parametrize(
+    ("raw_source", "expected_kind", "expected_value"),
+    [
+        ("data/input/pipeline.log", "local_file", "data/input/pipeline.log"),
+        ("file:data/input/pipeline.log", "local_file", "data/input/pipeline.log"),
+        ("https://example.com/consoleText", "remote_url", "https://example.com/consoleText"),
+        ("url:https://example.com/consoleText", "remote_url", "https://example.com/consoleText"),
+        ("-", "stdin", "-"),
+        ("text:line one\nline two", "inline_text", "line one\nline two"),
+    ],
+)
+def test_resolve_log_source_spec(raw_source, expected_kind, expected_value):
+    source = APP_MODULE.resolve_log_source_spec(raw_source)
+
+    assert source["kind"] == expected_kind
+    assert source["value"] == expected_value
+
+
+def test_parse_args_supports_unified_log_source_env(monkeypatch):
+    monkeypatch.setenv("LOG_SOURCE", "data/input/pipeline.log")
+    monkeypatch.setenv("OUTPUT_FILE", "output/analysis.md")
+    monkeypatch.setattr(APP_MODULE.sys, "argv", ["app.py"])
+
+    args = APP_MODULE.parse_args()
+
+    assert args.log_source == "data/input/pipeline.log"
+    assert args.log_source_spec["kind"] == "local_file"
+    assert args.log_file == "data/input/pipeline.log"
+    assert args.log_url is None
+
+
+def test_read_log_from_stdin(monkeypatch):
+    monkeypatch.setattr(APP_MODULE.sys, "stdin", io.StringIO("line 1\nline 2\n"))
+
+    assert APP_MODULE.read_log_from_stdin() == "line 1\nline 2\n"
 
 
 def test_build_source_headers_uses_basic_auth():

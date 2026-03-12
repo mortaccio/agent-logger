@@ -4,7 +4,7 @@ Minimal practical MVP for Azure DevOps pipeline log analysis with Ollama.
 
 The main runtime path is now a single containerized log agent:
 
-- input: local `pipeline.log` file or remote `consoleText` URL
+- input: one `LOG_SOURCE` value that can point to a local file, remote `consoleText` URL, stdin, or inline log text
 - execution: Python + deterministic tools + Ollama `/api/chat`
 - output: `analysis.md` or `analysis.json`
 
@@ -75,9 +75,18 @@ If the selected model does not support native Ollama `tools`, the agent automati
 
 ## Local CLI Usage
 
+Primary CLI input switch:
+
+- `--log-source data/input/pipeline.log`
+- `--log-source http://localhost:8080/job/petclinic%20pipeline/lastBuild/consoleText`
+- `--log-source -` to read the log from stdin
+- `--log-source 'text:##[error]Command failed with exit code 1'` for quick inline checks
+
+Local file:
+
 ```bash
 python3 agents/summarizer/app.py \
-  --log-file data/input/pipeline.log \
+  --log-source data/input/pipeline.log \
   --output-file output/analysis.md \
   --question "Analyze why this Azure DevOps pipeline failed and suggest the next checks." \
   --model llama3:latest \
@@ -92,10 +101,20 @@ export LOG_SOURCE_USERNAME=jenkins-user
 export LOG_SOURCE_PASSWORD=jenkins-api-token
 
 python3 agents/summarizer/app.py \
-  --log-url http://localhost:8080/job/petclinic%20pipeline/lastBuild/consoleText \
+  --log-source http://localhost:8080/job/petclinic%20pipeline/lastBuild/consoleText \
   --output-file output/analysis.md \
   --poll-interval-seconds 30 \
   --state-file output/.log-agent-state.json \
+  --model llama3:latest \
+  --ollama-host http://127.0.0.1:11434
+```
+
+Stdin:
+
+```bash
+cat data/input/pipeline.log | python3 agents/summarizer/app.py \
+  --log-source - \
+  --output-file output/analysis.md \
   --model llama3:latest \
   --ollama-host http://127.0.0.1:11434
 ```
@@ -104,11 +123,18 @@ JSON output:
 
 ```bash
 python3 agents/summarizer/app.py \
-  --log-file data/input/pipeline.log \
+  --log-source data/input/pipeline.log \
   --output-file output/analysis.json \
   --model llama3:latest \
   --ollama-host http://127.0.0.1:11434
 ```
+
+Backward-compatible legacy aliases still work:
+
+- `--log-file`
+- `--log-url`
+- `LOG_FILE`
+- `LOG_URL`
 
 ## Docker Compose
 
@@ -127,6 +153,12 @@ By default it watches:
 - Jenkins log URL: `http://localhost:8080/job/petclinic%20pipeline/lastBuild/consoleText`
 - output file: `output/analysis.md`
 - state file: `output/.log-agent-state.json`
+
+Fast source switching in compose:
+
+- remote URL: set `LOG_SOURCE=http://localhost:8080/job/.../consoleText`
+- project file: set `LOG_SOURCE=/data/input/pipeline.log`
+- the compose file mounts `./data` into `/data` for this flow
 
 If Jenkins protects `consoleText`, provide one of:
 
