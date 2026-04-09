@@ -1,5 +1,6 @@
 # .gitignore
 .env
+.pytest_cache/
 output/
 data/ingested.txt
 data/summary.txt
